@@ -16,11 +16,18 @@ import type { APIRequestContext } from "@playwright/test";
 import { send, sendOk } from "../api-request";
 import { UserTypesApi } from "../user-types-api";
 
+/** The effective access status a user, agent or application read carries. */
+export type ApiAccessStatus = {
+  value: "ACTIVE" | "LOCKED" | "SUSPENDED";
+  details?: { reason?: string; operatorNote?: string };
+};
+
 export type ApiUser = {
   id: string;
   ouId: string;
   type: string;
   attributes: Record<string, unknown> & { username?: string; email?: string };
+  status?: ApiAccessStatus;
 };
 
 export class UsersApi {
@@ -59,6 +66,11 @@ export class UsersApi {
     const response = await sendOk(this.request, "GET", `/users?filter=${filter}`);
     const body = (await response.json()) as { users?: ApiUser[] };
     return body.users ?? [];
+  }
+
+  /** Read a single user by id, including its access status. */
+  async get(id: string): Promise<ApiUser> {
+    return (await sendOk(this.request, "GET", `/users/${id}`)).json() as Promise<ApiUser>;
   }
 
   async findByUsername(username: string): Promise<ApiUser | undefined> {

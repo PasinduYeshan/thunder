@@ -14,6 +14,7 @@
 
 import type { APIRequestContext } from "@playwright/test";
 import { send, sendOk } from "../api-request";
+import type { ApiAccessStatus } from "../users-api";
 
 export type ApiApplication = {
   id: string;
@@ -24,6 +25,7 @@ export type ApiApplication = {
   recoveryFlowId?: string | null;
   isRegistrationFlowEnabled?: boolean;
   allowedUserTypes?: string[];
+  status?: ApiAccessStatus;
   [key: string]: unknown;
 };
 

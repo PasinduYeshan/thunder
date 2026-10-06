@@ -40,7 +40,7 @@ const BROWSERS = [
 
 /**
  * Specs that mutate global, non-partitionable server state: the CORS allowed-origins list, the
- * shared sample app's flow bindings, the server-wide notification-sender and
+ * `accountAccess` lock policy, the shared sample app's flow bindings, the server-wide notification-sender and
  * identity_provider.<vendor>_base_url settings, each mock server's fixed port, and each branded
  * connection vendor's single fixed-name instance. Running them in more than one browser project at
  * a time is not just racy, it cannot work - the mock ports the backend is configured to call
@@ -55,6 +55,7 @@ const BROWSERS = [
  */
 const SERVER_STATE_SPECS = [
   "**/settings/cors-allowed-origins.spec.ts",
+  "**/settings/account-security.spec.ts",
   "**/sample-app-authentication/sample-app-mfa-login.spec.ts",
   "**/sample-app-authentication/sample-app-social-login.spec.ts",
   "**/connections/branded-connection-crud.spec.ts",

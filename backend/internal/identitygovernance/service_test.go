@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,6 @@ import (
 	tidcommon "github.com/thunder-id/thunderid/pkg/thunderidengine/common"
 	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
 	"github.com/thunder-id/thunderid/tests/mocks/observabilityprovidermock"
-	"github.com/thunder-id/thunderid/tests/mocks/serverconfigmock"
 	"github.com/thunder-id/thunderid/tests/mocks/sysauthzmock"
 )
 
@@ -795,6 +795,19 @@ func (s *ServiceTestSuite) TestSuspendWritesOneAtomicSuspension() {
 	s.port.AssertNotCalled(s.T(), "ClearAccessState", mock.Anything, mock.Anything, mock.Anything)
 }
 
+// The note limit counts characters, not bytes, and a longer note is refused before anything is written.
+func (s *ServiceTestSuite) TestSuspendTakesANoteUpToTheLimit() {
+	longest := strings.Repeat("é", maxOperatorNoteLength)
+	s.expectRead(s.activeEntity())
+	s.port.On("SetSuspension", mock.Anything, "e1", s.now, longest).Return(true, nil).Once()
+	s.Require().Nil(s.svc.Suspend(s.ctx, "e1", longest))
+	s.Require().Nil(s.svc.ValidateSuspend(s.ctx, "e1", longest))
+
+	s.requireServiceError(s.svc.Suspend(s.ctx, "e1", longest+"é"), ErrorOperatorNoteTooLong)
+	s.requireServiceError(s.svc.ValidateSuspend(s.ctx, "e1", longest+"é"), ErrorOperatorNoteTooLong)
+	s.port.AssertNumberOfCalls(s.T(), "SetSuspension", 1)
+}
+
 // An unknown identity is a client error, not a failed read.
 func (s *ServiceTestSuite) TestSuspendOfAnUnknownIdentityIsAClientError() {
 	s.port.On("GetGovernedEntity", mock.Anything, "missing", true).
@@ -1480,16 +1493,31 @@ func (s *ServiceTestSuite) TestRecordLoginSkipsEntityReadsWhenNoCategoryRecords(
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
-// Once any category records, the entity's own category decides.
+// Once any category records, the entity's own category decides, and an application never records.
 func (s *ServiceTestSuite) TestRecordLoginWritesNothingWhenThisCategoryDoesNot() {
-	s.source.EXPECT().Current(mock.Anything).Return(recordingConfig(0)).Once()
-	s.port.On("GetEntityProfile", mock.Anything, "e1").
-		Return(&providers.Entity{Category: providers.EntityCategoryAgent}, nil).Once()
+	everyCategoryRecords := recordingConfig(0)
+	everyCategoryRecords.Agent = &accountAccessCategory{RecordLastLogin: new(true)}
+	testCases := []struct {
+		name     string
+		config   accountAccessValue
+		category providers.EntityCategory
+	}{
+		{name: "agent", config: recordingConfig(0), category: providers.EntityCategoryAgent},
+		{name: "application", config: everyCategoryRecords, category: providers.EntityCategoryApp},
+	}
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			s.source.EXPECT().Current(mock.Anything).Return(tc.config).Once()
+			s.port.On("GetEntityProfile", mock.Anything, "e1").
+				Return(&providers.Entity{Category: tc.category}, nil).Once()
 
-	s.Require().Nil(s.svc.RecordLogin(s.ctx, "e1"))
+			s.Require().Nil(s.svc.RecordLogin(s.ctx, "e1"))
 
-	s.port.AssertNotCalled(s.T(), "RecordLogin",
-		mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+			s.port.AssertNotCalled(s.T(), "RecordLogin",
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
 }
 
 // The window is passed to the write, so the store compares without a read-modify-write.
@@ -1712,7 +1740,7 @@ func (s *ServiceTestSuite) TestLifecycleAuthorization() {
 			authz := sysauthzmock.NewSystemAuthorizationServiceInterfaceMock(s.T())
 			authz.EXPECT().IsActionAllowed(mock.Anything, tc.action, &sysauthz.ActionContext{
 				ResourceType: tc.resource, OUID: "ou-a", ResourceID: "e1",
-			}).Return(false, nil).Times(4)
+			}).Return(false, nil).Times(6)
 			svc := newTestService(s.T(), port, accountAccessValue{}, nil, authz)
 			for _, operation := range []struct {
 				name string
@@ -1720,7 +1748,15 @@ func (s *ServiceTestSuite) TestLifecycleAuthorization() {
 			}{
 				{"suspend", func() *tidcommon.ServiceError { return svc.Suspend(callerContext("operator"), "e1", "") }},
 				{"validate suspend", func() *tidcommon.ServiceError {
-					return svc.ValidateSuspend(callerContext("operator"), "e1")
+					return svc.ValidateSuspend(callerContext("operator"), "e1", "")
+				}},
+				// Authorized before the note is checked, so the limit cannot be probed from outside.
+				{"suspend with an over-long note", func() *tidcommon.ServiceError {
+					return svc.Suspend(callerContext("operator"), "e1", strings.Repeat("n", maxOperatorNoteLength+1))
+				}},
+				{"validate suspend with an over-long note", func() *tidcommon.ServiceError {
+					return svc.ValidateSuspend(callerContext("operator"), "e1",
+						strings.Repeat("n", maxOperatorNoteLength+1))
 				}},
 				{"unsuspend", func() *tidcommon.ServiceError { return svc.Unsuspend(callerContext("operator"), "e1") }},
 				{"unlock", func() *tidcommon.ServiceError { return svc.Unlock(callerContext("operator"), "e1") }},
@@ -1758,9 +1794,9 @@ func (s *ServiceTestSuite) TestValidateSuspendWritesNothing() {
 	authz := s.authorizer(true)
 	svc := newTestService(s.T(), port, accountAccessValue{}, nil, authz)
 
-	s.Require().Nil(svc.ValidateSuspend(callerContext("operator"), "e1"))
+	s.Require().Nil(svc.ValidateSuspend(callerContext("operator"), "e1", ""))
 	authz.AssertNumberOfCalls(s.T(), "IsActionAllowed", 1)
-	s.requireServiceError(svc.ValidateSuspend(callerContext("operator"), ""), ErrorMissingSubject)
+	s.requireServiceError(svc.ValidateSuspend(callerContext("operator"), "", ""), ErrorMissingSubject)
 	port.AssertNotCalled(s.T(), "SetSuspension", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
@@ -2116,9 +2152,19 @@ func (s *ServiceTestSuite) TestARefusedLifecycleOperationIsPublishedAsAFailure()
 			event.EventTypeIdentitySuspensionFailed, "not_authorized"},
 		{"suspend pre-check outside the boundary", agent, false,
 			func(s *identityGovernanceService) *tidcommon.ServiceError {
-				return s.ValidateSuspend(callerContext("operator"), "e1")
+				return s.ValidateSuspend(callerContext("operator"), "e1", "")
 			},
 			event.EventTypeIdentitySuspensionFailed, "not_authorized"},
+		{"suspend with an over-long note", agent, true,
+			func(s *identityGovernanceService) *tidcommon.ServiceError {
+				return s.Suspend(callerContext("operator"), "e1", strings.Repeat("n", maxOperatorNoteLength+1))
+			},
+			event.EventTypeIdentitySuspensionFailed, "note_too_long"},
+		{"suspend pre-check with an over-long note", agent, true,
+			func(s *identityGovernanceService) *tidcommon.ServiceError {
+				return s.ValidateSuspend(callerContext("operator"), "e1", strings.Repeat("n", maxOperatorNoteLength+1))
+			},
+			event.EventTypeIdentitySuspensionFailed, "note_too_long"},
 		{"unsuspend on an active identity", agent, true,
 			func(s *identityGovernanceService) *tidcommon.ServiceError {
 				return s.Unsuspend(callerContext("operator"), "e1")
@@ -2210,7 +2256,7 @@ func (s *ServiceTestSuite) TestAPassingSuspendPreCheckIsNotPublished() {
 		Return(new(governedSubject(providers.EntityCategoryUser)), nil)
 	svc, published := auditedService(s.T(), port, authorizerAllowing(s.T(), true))
 
-	s.Require().Nil(svc.ValidateSuspend(callerContext("operator"), "e1"))
+	s.Require().Nil(svc.ValidateSuspend(callerContext("operator"), "e1", ""))
 	s.Require().Empty(*published)
 }
 
@@ -2647,24 +2693,6 @@ func (s *ServiceTestSuite) TestReadAccessForAnApplicationReadsNoSection() {
 	s.source.AssertNotCalled(s.T(), "Current", mock.Anything)
 }
 
-func (s *ServiceTestSuite) TestSetServerConfigServiceSetsTheSectionReader() {
-	reader := serverconfigmock.NewServerConfigServiceMock(s.T())
-	s.source.EXPECT().setReader(reader).Once()
-
-	s.svc.SetServerConfigService(reader)
-}
-
-// The lock email reads its default sender through the same server-config service.
-func (s *ServiceTestSuite) TestSetServerConfigServiceReachesTheNotifier() {
-	reader := serverconfigmock.NewServerConfigServiceMock(s.T())
-	notifier := newLockNotifierInterfaceMock(s.T())
-	s.source.EXPECT().setReader(reader).Once()
-	notifier.EXPECT().setServerConfigService(reader).Once()
-	svc := newIdentityGovernanceService(s.port, s.source, notifier, nil, nil)
-
-	svc.SetServerConfigService(reader)
-}
-
 // testAccountAccessConfig is a representative deployment: a user default and agent locking switched
 // off.
 func testAccountAccessConfig() accountAccessValue {
@@ -3010,7 +3038,7 @@ func (s *ServiceTestSuite) TestAnUnknownIdentityIsPublishedAsNotFound() {
 			return svc.Suspend(s.ctx, "x", "")
 		},
 		"validate suspend": func(svc *identityGovernanceService) *tidcommon.ServiceError {
-			return svc.ValidateSuspend(s.ctx, "x")
+			return svc.ValidateSuspend(s.ctx, "x", "")
 		},
 		"unsuspend": func(svc *identityGovernanceService) *tidcommon.ServiceError {
 			return svc.Unsuspend(s.ctx, "x")

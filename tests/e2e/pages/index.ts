@@ -5,6 +5,6 @@ export { ConsoleSigninPage } from "./authentication";
 export { UsersPage, type UserFormData } from "./user-management";
 export { UserTypesPage } from "./user-types";
 export { ApplicationsPage, type ApplicationFormData } from "./applications";
-export { SettingsPage } from "./settings";
+export { SettingsPage, AccountSecurityPage } from "./settings";
 export { WelcomePage } from "./welcome";
 export { ConnectionsPage, type BrandedConnectionFormData } from "./connections";

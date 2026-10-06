@@ -6,3 +6,4 @@
  */
 
 export { SettingsPage } from "./settings.page";
+export { AccountSecurityPage, type LockCategory } from "./account-security.page";

@@ -17,6 +17,7 @@ import { Page, Locator, expect } from "@playwright/test";
 import { ConsoleRoutes } from "../../configs/routes/console-routes";
 import { BasePage } from "../base.page";
 import { Timeouts } from "../../constants/timeouts";
+import { AccountStatusControls } from "../components/account-status-controls";
 
 export type UserFormData = {
   username: string;
@@ -86,9 +87,13 @@ export class UsersPage extends BasePage {
   readonly confirmResetPasswordButton: Locator;
   readonly cancelResetPasswordButton: Locator;
 
+  // Lifecycle controls (User Details page header: Actions menu, its dialogs and the status banner)
+  readonly accountStatus: AccountStatusControls;
+
   constructor(page: Page, baseUrl: string) {
     super(page);
     this.baseUrl = baseUrl;
+    this.accountStatus = new AccountStatusControls(page);
 
     // Add User button
     this.addUserButton = page

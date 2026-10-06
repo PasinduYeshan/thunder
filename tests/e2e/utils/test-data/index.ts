@@ -63,6 +63,16 @@ export class TestDataFactory {
   }
 
   /**
+   * Generate agent data
+   */
+  static createAgent(overrides?: Partial<AgentData>): AgentData {
+    return {
+      name: `TestAgent_${this.generateUniqueId()}`,
+      ...overrides,
+    };
+  }
+
+  /**
    * Generate multiple test data items
    */
   static createBulkUsers(count: number, baseData?: Partial<UserData>): UserData[] {
@@ -77,6 +87,10 @@ export interface UserData {
   family_name: string;
   password: string;
   [key: string]: any;
+}
+
+export interface AgentData {
+  name: string;
 }
 
 export interface ApplicationData {

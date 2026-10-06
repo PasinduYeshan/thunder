@@ -9,7 +9,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/thunder-id/thunderid/internal/serverconfig"
 	syscontext "github.com/thunder-id/thunderid/internal/system/context"
 	"github.com/thunder-id/thunderid/internal/system/log"
 	"github.com/thunder-id/thunderid/internal/system/observability/event"
@@ -57,7 +56,7 @@ type IdentityGovernanceServiceInterface interface {
 	Suspend(ctx context.Context, entityID, operatorNote string) *tidcommon.ServiceError
 
 	// ValidateSuspend runs Suspend's checks without writing.
-	ValidateSuspend(ctx context.Context, entityID string) *tidcommon.ServiceError
+	ValidateSuspend(ctx context.Context, entityID, operatorNote string) *tidcommon.ServiceError
 
 	// Unsuspend releases the hold. A user is left under a permanent entity-wide lock; an agent or an
 	// application becomes active.
@@ -72,11 +71,6 @@ type IdentityGovernanceServiceInterface interface {
 	// ReadAccess derives what management reads report for each entity, in order: the effective status
 	// and the last login time. Each category's lockout policy is resolved once per call.
 	ReadAccess(ctx context.Context, entities []providers.Entity) []AccessRead
-
-	// SetServerConfigService injects the server-config service the accountAccess section and the lock
-	// email's default sender are read from. It is built after governance, since it takes the section
-	// handler Initialize returns.
-	SetServerConfigService(serverConfigService serverconfig.ServerConfigService)
 }
 
 // entityStateProvider reads and writes the governed state. The entity service implements it.
@@ -287,6 +281,9 @@ func (s *identityGovernanceService) Suspend(ctx context.Context,
 	if svcErr != nil {
 		return svcErr
 	}
+	if isOperatorNoteTooLong(operatorNote) {
+		return &ErrorOperatorNoteTooLong
+	}
 	// Already suspended: write nothing and keep the first placement time and note.
 	if isSuspended(entity.State, entity.AccessState) {
 		record.message = messageSuspensionInPlace
@@ -306,7 +303,7 @@ func (s *identityGovernanceService) Suspend(ctx context.Context,
 
 // ValidateSuspend runs Suspend's checks without writing. Only a refusal is audited.
 func (s *identityGovernanceService) ValidateSuspend(ctx context.Context,
-	entityID string) (svcErr *tidcommon.ServiceError) {
+	entityID, operatorNote string) (svcErr *tidcommon.ServiceError) {
 	record := lifecycleAudit{failed: event.EventTypeIdentitySuspensionFailed, entityID: entityID}
 	defer func() {
 		if svcErr != nil {
@@ -314,8 +311,13 @@ func (s *identityGovernanceService) ValidateSuspend(ctx context.Context,
 		}
 	}()
 
-	_, svcErr = s.governedForLifecycle(ctx, entityID, &record)
-	return svcErr
+	if _, svcErr = s.governedForLifecycle(ctx, entityID, &record); svcErr != nil {
+		return svcErr
+	}
+	if isOperatorNoteTooLong(operatorNote) {
+		return &ErrorOperatorNoteTooLong
+	}
+	return nil
 }
 
 // Unsuspend releases the hold and, for a user, writes a permanent entity-wide lock in the same
@@ -413,14 +415,6 @@ func (s *identityGovernanceService) ReadAccess(ctx context.Context, entities []p
 		reads[i] = accessReadFor(entity, enforcement, now)
 	}
 	return reads
-}
-
-// SetServerConfigService injects the server-config service. See IdentityGovernanceServiceInterface.
-func (s *identityGovernanceService) SetServerConfigService(serverConfigService serverconfig.ServerConfigService) {
-	s.source.setReader(serverConfigService)
-	if s.notifier != nil {
-		s.notifier.setServerConfigService(serverConfigService)
-	}
 }
 
 // enforcementFor resolves which recorded locks a category's policy enforces. An application has no

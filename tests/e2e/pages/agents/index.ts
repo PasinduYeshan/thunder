@@ -6,3 +6,4 @@
  */
 
 export { AgentOnboardingPage } from "./agent-onboarding.page";
+export { AgentDetailsPage } from "./agent-details.page";

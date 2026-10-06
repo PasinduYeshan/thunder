@@ -5,6 +5,7 @@ import { Page, Locator, expect } from "@playwright/test";
 import { ConsoleRoutes } from "../../configs/routes/console-routes";
 import { BasePage } from "../base.page";
 import { Timeouts } from "../../constants/timeouts";
+import { AccountStatusControls } from "../components/account-status-controls";
 
 export type ApplicationFormData = {
   name: string;
@@ -51,9 +52,13 @@ export class ApplicationsPage extends BasePage {
   readonly addUriButton: Locator;
   readonly deleteApplicationButton: Locator;
 
+  // Edit page — header lifecycle controls (Actions menu, its dialogs and the status banner)
+  readonly accountStatus: AccountStatusControls;
+
   constructor(page: Page, baseUrl: string) {
     super(page);
     this.baseUrl = baseUrl;
+    this.accountStatus = new AccountStatusControls(page);
 
     // List page
     this.addApplicationButton = page.locator('[data-testid="application-add-button"]');

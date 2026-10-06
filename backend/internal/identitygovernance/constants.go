@@ -81,8 +81,12 @@ const (
 	failureNotApplicable   lifecycleFailure = "not_applicable"
 	failureNoSubject       lifecycleFailure = "no_subject"
 	failureNotFound        lifecycleFailure = "not_found"
+	failureNoteTooLong     lifecycleFailure = "note_too_long"
 	failureOperationFailed lifecycleFailure = "operation_failed"
 )
+
+// maxOperatorNoteLength is the longest operator note a suspension takes, in characters.
+const maxOperatorNoteLength = 100
 
 // Lifecycle audit messages, published with a successful operation.
 const (

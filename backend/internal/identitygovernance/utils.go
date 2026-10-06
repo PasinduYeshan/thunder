@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/thunder-id/thunderid/internal/serverconfig"
 	sysconfig "github.com/thunder-id/thunderid/internal/system/config"
@@ -162,6 +163,11 @@ func refuse(mode disclosureMode, reason providers.AccessRefusalReason) providers
 	return providers.AccessDecision{Reason: reason}
 }
 
+// isOperatorNoteTooLong reports whether a suspension's operator note exceeds the limit.
+func isOperatorNoteTooLong(note string) bool {
+	return utf8.RuneCountInString(note) > maxOperatorNoteLength
+}
+
 // failureClass maps a lifecycle error to its failure class, without store detail.
 func failureClass(svcErr *tidcommon.ServiceError) lifecycleFailure {
 	switch svcErr.Code {
@@ -173,6 +179,8 @@ func failureClass(svcErr *tidcommon.ServiceError) lifecycleFailure {
 		return failureNoSubject
 	case ErrorEntityNotFound.Code:
 		return failureNotFound
+	case ErrorOperatorNoteTooLong.Code:
+		return failureNoteTooLong
 	default:
 		return failureOperationFailed
 	}

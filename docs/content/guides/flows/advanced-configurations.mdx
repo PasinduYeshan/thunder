@@ -371,6 +371,10 @@ Every flow you deploy must reference only executors that are registered on the s
 | **Attribute Collector** | Collects additional user attributes defined in the user type. | - |
 | **Validate Attribute Uniqueness** | Checks that unique attributes are not already registered. | User Type Resolver must have run |
 | **Set Credentials** | Sets credentials (e.g., password) for an existing user. | - |
+| **Validate and Plan Suspension** | Checks that the administrator may suspend the account, then plans which tokens the revocation nodes withdraw. | Administration flows only |
+| **Suspend Identity** | Suspends the account that Validate and Plan Suspension planned. | Validate and Plan Suspension must have run. See [Account Locks and Suspension](../../account-locks-and-suspension) |
+| **Unsuspend Identity** | Lifts a suspension. A user is left locked until recovery or an unlock. | Administration flows only |
+| **Unlock Identity** | Clears every lock on a user or agent. In a recovery flow, releases the account whose credential the flow set. | In a recovery flow, Set Credentials must have run |
 | **OpenID4VP Verify** | Initiates an OpenID4VP credential presentation request, returns a QR code and deep link for the user's wallet, and polls until the credential is verified. | OpenID4VP service configured in <ProductName /> |
 | **Authorization** | Evaluates authorization policies for the current user. | - |
 | **User Consent** | Records explicit user consent for defined scopes or terms. | - |
@@ -553,6 +557,17 @@ Sets credentials (e.g., password) for an existing user. Typically used in regist
 - Credential value not provided
 - User not found in the user store
 - Credential update failed
+
+**Account locks in recovery flows:** setting a credential does not release an account lock. In a recovery flow, place an **Unlock Identity** node (`IdentityGovernanceExecutor` in `unlock` mode) right after this executor, as the default recovery flows do. Without it, a locked user who completes recovery stays locked. The node releases only the account whose credential this flow set. If identity governance is off or refuses the release, the step completes and the lock stays. If the release fails on a server error, the step fails and the user can run recovery again.
+
+```json
+{
+  "id": "release_account_locks",
+  "type": "TASK_EXECUTION",
+  "executor": { "name": "IdentityGovernanceExecutor", "mode": "unlock" },
+  "onSuccess": "recovery_complete"
+}
+```
 
 </details>
 
@@ -1739,6 +1754,73 @@ Creates a new Organizational Unit. The created OU is available for use by downst
 
 </details>
 
+#### Account Lifecycle
+
+These executors run the suspend, unsuspend, and unlock administration flows, and release an account lock at the end of a recovery flow. See [Account Locks and Suspension](../../account-locks-and-suspension).
+
+<details>
+<summary>Validate and Plan Suspension</summary>
+
+Checks that the administrator may suspend the account, then plans which tokens the revocation nodes withdraw. If this check refuses the operation, no token or session is affected. A later failure can leave revocation or session termination partially completed without placing the suspension.
+
+**When to use:** In a suspend administration flow, after **Validate Permission** and before **Revoke Tokens**, **Revoke Sessions**, and **Suspend Identity**.
+
+**Input Configuration:**
+- `subject` (required): the ID of the user, agent, or application to suspend. When it is missing, the flow asks for it.
+
+**Example:**
+
+```json
+{
+  "id": "pre_suspend",
+  "type": "TASK_EXECUTION",
+  "executor": { "name": "PreSuspendExecutor" },
+  "onSuccess": "revoke_tokens"
+}
+```
+
+**Failure conditions:**
+- The administrator may not suspend the account, targets their own user or agent, or the account does not exist
+
+</details>
+
+<details>
+<summary>Suspend, Unsuspend, and Unlock Identity</summary>
+
+One executor, `IdentityGovernanceExecutor`, applies one lifecycle operation, selected by the node `mode`. The mode has no default, so a node without one fails flow validation.
+
+| Mode | Console label | What it does |
+|---|---|---|
+| `suspend` | **Suspend Identity** | Suspends the account that **Validate and Plan Suspension** planned. On an account that is already suspended it writes nothing, so the original time and note are kept, but the revocation nodes before it still run. |
+| `unsuspend` | **Unsuspend Identity** | Lifts a suspension. A user receives a permanent account-wide lock, even if automatic locking is disabled. An agent keeps any automatic lock still in force. |
+| `unlock` | **Unlock Identity** | Clears all locks and their history, including the lock left after a user is unsuspended. It does not lift a suspension. |
+
+**When to use:** In the administration flows that suspend, unsuspend, or unlock an account. In a recovery flow, only `unlock` runs, right after **Set Credentials**.
+
+**Input Configuration:**
+- `subject` (required in administration flows): the ID of the user, agent, or application to unsuspend, or of the user or agent to unlock. The node asks for it when it is missing. In `suspend` mode the account comes from **Validate and Plan Suspension**. In a recovery flow, the account is the one whose credential the flow set, and the input is ignored.
+- `operatorNote` (optional): a note of at most 100 characters recorded with a suspension and returned on management reads. A suspension with a longer note fails. Other modes accept and ignore it.
+
+**Example:**
+
+```json
+{
+  "id": "access_governance",
+  "type": "TASK_EXECUTION",
+  "executor": { "name": "IdentityGovernanceExecutor", "mode": "unsuspend" },
+  "onSuccess": "end"
+}
+```
+
+**Failure conditions:**
+- The administrator may not manage the account, targets their own user or agent, or the account does not exist
+- The operation does not apply, such as unsuspending an account that is not suspended
+- In a recovery flow, no earlier step proved control of the account
+
+An administrative refusal or missing recovery proof fails the flow with `FET-1112`, which does not name the cause. The server logs the cause at debug level. If proof exists but the governance provider refuses the recovery unlock, the step completes without releasing the lock. This also applies when identity governance is disabled. A server error fails the operation.
+
+</details>
+
 #### Notifications
 
 <details>
@@ -1763,6 +1845,7 @@ Sends a transactional email using a configured template. Runs in the background:
 |---|---|---|---|---|
 | `senderId` | Not shown | Yes, at runtime | - | ID of the email provider the step sends through. The step fails without it. The executor schema marks it optional only because built-in flows include email steps before any provider exists. Set it through the Flow Management API or a declarative flow file. |
 | `emailTemplate` | Email Template | No | `user_invite` | The template scenario to use. If absent or empty, defaults to the user invite template. |
+| `bestEffort` | Not shown | No | `false` | When `true`, a send that fails completes the step instead of failing the flow, and the flow response carries `emailSent` as `"false"`. Server-side failures are logged. Set it through the Flow Management API or a declarative flow file. |
 
 **Input Configuration:** None. The email executor resolves the recipient and template data from runtime context; it has no configurable node input defaults.
 
@@ -1790,6 +1873,8 @@ Sends a transactional email using a configured template. Runs in the background:
 - Recipient email address not resolvable from context or user entity
 - Template rendering error
 - SMTP server unreachable or rejecting the message (server error)
+
+With `bestEffort` set to `true`, none of these fail the step.
 
 </details>
 
