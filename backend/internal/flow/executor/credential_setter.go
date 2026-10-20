@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 
 	"github.com/thunder-id/thunderid/internal/entityprovider"
+	"github.com/thunder-id/thunderid/internal/flow/common"
 	"github.com/thunder-id/thunderid/internal/flow/core"
 	"github.com/thunder-id/thunderid/internal/system/log"
 	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
@@ -17,6 +18,7 @@ type credentialSetter struct {
 	providers.Executor
 	entityProvider entityprovider.EntityProviderInterface
 	authnProvider  providers.AuthnProviderManager
+	accessGuard    *accessGuard
 	logger         *log.Logger
 }
 
@@ -25,6 +27,7 @@ func newCredentialSetter(
 	flowFactory core.FlowFactoryInterface,
 	entityProvider entityprovider.EntityProviderInterface,
 	authnProvider providers.AuthnProviderManager,
+	governance providers.IdentityGovernanceProvider,
 ) *credentialSetter {
 	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "CredentialSetter"))
 	base := flowFactory.CreateExecutor(
@@ -50,6 +53,7 @@ func newCredentialSetter(
 		Executor:       base,
 		entityProvider: entityProvider,
 		authnProvider:  authnProvider,
+		accessGuard:    newAccessGuard(governance, logger),
 		logger:         logger,
 	}
 }
@@ -123,15 +127,39 @@ func (e *credentialSetter) Execute(ctx *providers.NodeContext) (*providers.Execu
 		return execResp, nil
 	}
 
+	// The credential write behind recovery, gated on the same plane as the identifying step. The
+	// two are separate requests, so a hold applied between them has to be caught here as well,
+	// otherwise an account suspended mid-flow still gets its password replaced.
+	held, stated, fault := e.accessGuard.heldAt(ctx.Context, userID, providers.AccessPlaneRecovery, "")
+	if fault != nil {
+		// Answered as the credential write failing below is; the authority has logged the cause.
+		execResp.Status = providers.ExecFailure
+		execResp.Error = &ErrCredentialSetFailed
+		return execResp, nil
+	}
+	if held {
+		execResp.Status = providers.ExecFailure
+		// The stated hold, or this executor's own failure when the decision names none.
+		if stated != nil {
+			execResp.Error = stated
+		} else {
+			execResp.Error = &ErrCredentialSetFailed
+		}
+		return execResp, nil
+	}
+
 	// Update user credentials
-	svcErr := e.entityProvider.UpdateCredentials(userID, credentials)
-	if svcErr != nil {
+	if providerErr := e.entityProvider.UpdateCredentials(userID, credentials); providerErr != nil {
 		logger.Debug(ctx.Context, "Failed to update user credentials",
 			log.MaskedString(log.LoggerKeyUserID, userID))
 		execResp.Status = providers.ExecFailure
 		execResp.Error = &ErrCredentialSetFailed
 		return execResp, nil
 	}
+
+	// Record proof of control for a later node, such as an unlock, now that the credential write
+	// has succeeded.
+	execResp.SharedRuntimeData = map[string]string{common.RuntimeKeyProvenSubject: userID}
 
 	logger.Debug(ctx.Context, "Successfully set credentials for user",
 		log.MaskedString(log.LoggerKeyUserID, userID))

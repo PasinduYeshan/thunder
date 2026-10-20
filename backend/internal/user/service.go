@@ -20,6 +20,7 @@ import (
 	authnprovidercm "github.com/thunder-id/thunderid/internal/authnprovider/common"
 	"github.com/thunder-id/thunderid/internal/entity"
 	"github.com/thunder-id/thunderid/internal/entitytype"
+	"github.com/thunder-id/thunderid/internal/identitygovernance"
 	oupkg "github.com/thunder-id/thunderid/internal/ou"
 	serverconst "github.com/thunder-id/thunderid/internal/system/constants"
 	declarativeresource "github.com/thunder-id/thunderid/internal/system/declarative_resource"
@@ -62,6 +63,7 @@ type UserServiceInterface interface {
 type userService struct {
 	authzService       sysauthz.SystemAuthorizationServiceInterface
 	entityService      entity.EntityServiceInterface
+	governance         identitygovernance.IdentityGovernanceServiceInterface
 	ouService          oupkg.OrganizationUnitServiceInterface
 	entityTypeService  entitytype.EntityTypeServiceInterface
 	uuidGenerator      func() (string, error)
@@ -75,11 +77,13 @@ func newUserService(
 	entityService entity.EntityServiceInterface,
 	ouService oupkg.OrganizationUnitServiceInterface,
 	entityTypeService entitytype.EntityTypeServiceInterface,
+	governance identitygovernance.IdentityGovernanceServiceInterface,
 	valueCapturer declarativeresource.ValueCapturer,
 ) UserServiceInterface {
 	return &userService{
 		authzService:      authzService,
 		entityService:     entityService,
+		governance:        governance,
 		ouService:         ouService,
 		entityTypeService: entityTypeService,
 		uuidGenerator:     utils.GenerateUUIDv7,
@@ -129,7 +133,7 @@ func (us *userService) listAllUsers(
 		return nil, logErrorAndReturnServerError(ctx, logger, "Failed to get user list", err)
 	}
 
-	users := entitiesToUsers(entities)
+	users := entitiesToUsersWithAccess(us.readAccess(ctx, entities), entities)
 	if includeDisplay {
 		us.populateUserDisplayNames(ctx, users, logger)
 		us.populateOUHandles(ctx, users, logger)
@@ -160,7 +164,7 @@ func (us *userService) listUsersByOUIDs(
 		return nil, logErrorAndReturnServerError(ctx, logger, "Failed to get user list", err)
 	}
 
-	users := entitiesToUsers(entities)
+	users := entitiesToUsersWithAccess(us.readAccess(ctx, entities), entities)
 	if includeDisplay {
 		us.populateUserDisplayNames(ctx, users, logger)
 		us.populateOUHandles(ctx, users, logger)
@@ -419,6 +423,7 @@ func (us *userService) GetUser(
 	if svcErr := us.checkUserAccess(ctx, security.ActionReadUser, user.OUID, userID); svcErr != nil {
 		return nil, svcErr
 	}
+	applyAccess(&user, us.accessOf(ctx, e))
 
 	if includeDisplay {
 		displayAttrPaths := entitytype.ResolveDisplayAttributePaths(
@@ -470,7 +475,7 @@ func (as *userService) GetUserGroups(ctx context.Context, userID string, limit, 
 	}
 
 	// Fetch user to resolve the OU ID for the authorization check.
-	userEntity, err := as.entityService.GetEntity(ctx, userID)
+	userEntity, err := as.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			logger.Debug(ctx, "User not found", log.MaskedString(log.LoggerKeyUserID, userID))
@@ -531,7 +536,7 @@ func (us *userService) UpdateUser(
 	}
 
 	// Fetch the existing user to obtain its OU ID for the authorization check.
-	existingEntity, err := us.entityService.GetEntity(ctx, userID)
+	existingEntity, err := us.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			logger.Debug(ctx, "User not found", log.MaskedString(log.LoggerKeyUserID, userID))
@@ -700,6 +705,8 @@ func (us *userService) UpdateUserAttributes(
 			log.MaskedString(log.LoggerKeyUserID, userID))
 	}
 
+	applyAccess(&existingUser, us.accessOf(ctx, existingEntity))
+
 	logger.Debug(ctx, "Successfully updated user attributes", log.MaskedString(log.LoggerKeyUserID, userID))
 	return &existingUser, nil
 }
@@ -741,7 +748,7 @@ func (us *userService) UpdateUserCredentials(
 	}
 
 	// Fetch user outside the transaction to resolve the OU ID for the authorization check.
-	existingEntity, err := us.entityService.GetEntity(ctx, userID)
+	existingEntity, err := us.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			logger.Debug(ctx, "User not found", log.MaskedString(log.LoggerKeyUserID, userID))
@@ -806,7 +813,7 @@ func (us *userService) ValidateDeleteUser(ctx context.Context, userID string) *t
 	if userID == "" {
 		return &ErrorMissingUserID
 	}
-	existingEntity, err := us.entityService.GetEntity(ctx, userID)
+	existingEntity, err := us.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			return &ErrorUserNotFound
@@ -837,7 +844,7 @@ func (us *userService) DeleteUser(ctx context.Context, userID string) *tidcommon
 	}
 
 	// Fetch the user to resolve the OU ID for the authorization check.
-	existingEntity, err := us.entityService.GetEntity(ctx, userID)
+	existingEntity, err := us.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			logger.Debug(ctx, "User not found", log.MaskedString(log.LoggerKeyUserID, userID))
@@ -966,7 +973,7 @@ func (us *userService) GetUserUsages(
 		return nil, &ErrorMissingUserID
 	}
 
-	existingEntity, err := us.entityService.GetEntity(ctx, userID)
+	existingEntity, err := us.entityService.GetEntityProfile(ctx, userID)
 	if err != nil {
 		if errors.Is(err, entity.ErrEntityNotFound) {
 			return nil, &ErrorUserNotFound
@@ -1125,6 +1132,24 @@ func (us *userService) validateOrganizationUnitForUserType(
 		return &ErrorOrganizationUnitMismatch
 	}
 
+	return nil
+}
+
+// readAccess derives the access facts of the users, resolving the lockout policy once. Without
+// governance nothing is derived.
+func (us *userService) readAccess(ctx context.Context,
+	entities []providers.Entity) []identitygovernance.AccessRead {
+	if us.governance == nil {
+		return nil
+	}
+	return us.governance.ReadAccess(ctx, entities)
+}
+
+// accessOf derives the access facts of one user, or nil without governance.
+func (us *userService) accessOf(ctx context.Context, e *providers.Entity) *identitygovernance.AccessRead {
+	if reads := us.readAccess(ctx, []providers.Entity{*e}); len(reads) > 0 {
+		return &reads[0]
+	}
 	return nil
 }
 

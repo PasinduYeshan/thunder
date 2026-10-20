@@ -1837,29 +1837,39 @@ func GetWritableServerConfig(section string) (json.RawMessage, error) {
 
 // PutWritableServerConfig replaces the writable layer of the named server-config section.
 func PutWritableServerConfig(section string, body []byte) error {
+	status, respBody, err := PutWritableServerConfigWithStatus(section, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("expected status 200 updating %s server config with %s, got %d. Response: %s",
+			section, string(body), status, string(respBody))
+	}
+	return nil
+}
+
+// PutWritableServerConfigWithStatus is PutWritableServerConfig for a write the server may refuse: it
+// returns the status and body whatever they are, and an error only when no answer came back.
+func PutWritableServerConfigWithStatus(section string, body []byte) (int, []byte, error) {
 	url := fmt.Sprintf("%s/server-config/%s", TestServerURL, section)
 
 	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("failed to create %s server config request: %w", section, err)
+		return 0, nil, fmt.Errorf("failed to create %s server config request: %w", section, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := GetHTTPClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to update %s server config: %w", section, err)
+		return 0, nil, fmt.Errorf("failed to update %s server config: %w", section, err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read %s server config response: %w", section, err)
+		return 0, nil, fmt.Errorf("failed to read %s server config response: %w", section, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("expected status 200 updating %s server config with %s, got %d. Response: %s",
-			section, string(body), resp.StatusCode, string(respBody))
-	}
-	return nil
+	return resp.StatusCode, respBody, nil
 }
 
 // MergeWritableServerConfig applies the given top-level keys over the current writable layer of the
@@ -2962,4 +2972,79 @@ func DeleteResource(resourceServerID, resourceID string) error {
 		return fmt.Errorf("expected status 204, got %d. Response: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
+}
+
+// RunAdministrationFlow executes an ADMINISTRATION flow, addressed by handle, as the admin and
+// returns the HTTP status and the flow status. It is how a test suspends, unsuspends or unlocks an
+// identity.
+func RunAdministrationFlow(handle string, inputs map[string]string) (int, string, error) {
+	token, err := GetAccessToken()
+	if err != nil {
+		return 0, "", err
+	}
+	return RunAdministrationFlowWithToken(token, handle, inputs)
+}
+
+// RunAdministrationFlowWithToken is RunAdministrationFlow as the operator the bearer token names.
+func RunAdministrationFlowWithToken(token, handle string, inputs map[string]string) (int, string, error) {
+	status, body, err := ExecuteAdministrationFlowWithToken(token, handle, inputs)
+	if err != nil {
+		return 0, "", err
+	}
+	var step struct {
+		FlowStatus string `json:"flowStatus"`
+	}
+	_ = json.Unmarshal(body, &step)
+	return status, step.FlowStatus, nil
+}
+
+// ExecuteAdministrationFlowWithToken executes an ADMINISTRATION flow, addressed by handle, as the
+// operator the bearer token names, and returns the HTTP status and the raw answer, for a caller that
+// reads an error code. The token goes on the raw client because the shared clients treat
+// /flow/execute as public.
+func ExecuteAdministrationFlowWithToken(token, handle string, inputs map[string]string) (int, []byte, error) {
+	flowID, err := GetFlowIDByHandle(handle, "ADMINISTRATION")
+	if err != nil {
+		return 0, nil, err
+	}
+	payload, err := json.Marshal(map[string]interface{}{"flowId": flowID, "inputs": inputs})
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, TestServerURL+"/flow/execute", bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := GetRawHTTPClient().Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// GetAccessStatus returns the effective access status a management read reports for a governed
+// identity; collection is users, agents or applications. A read without a status is an error, since
+// every governed read carries one, ACTIVE included.
+func GetAccessStatus(collection, entityID string) (*AccessStatus, error) {
+	body, err := getJSON(fmt.Sprintf("%s/%s/%s", TestServerURL, collection, entityID))
+	if err != nil {
+		return nil, err
+	}
+	var read struct {
+		Status *AccessStatus `json:"status"`
+	}
+	if err := json.Unmarshal(body, &read); err != nil {
+		return nil, fmt.Errorf("failed to parse the %s read: %w", collection, err)
+	}
+	if read.Status == nil {
+		return nil, fmt.Errorf("the %s read carries no status: %s", collection, string(body))
+	}
+	return read.Status, nil
 }

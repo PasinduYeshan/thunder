@@ -92,6 +92,87 @@ func (ts *ControlPlaneTestSuite) TestRuntimeEndpointsAreNotServed() {
 	}
 }
 
+// The account access policy and the notification defaults are configuration, so a Control Plane
+// serves both sections for authoring and export. A policy written here is the one exported.
+func (ts *ControlPlaneTestSuite) TestTheAccountAccessAndNotificationSectionsAreServed() {
+	for _, name := range []string{"accountAccess", "notification"} {
+		status, raw := ts.call(http.MethodGet, "/server-config/"+name, nil, nil)
+		ts.Equal(http.StatusOK, status, "%s: %s", name, raw)
+	}
+
+	original := ts.writableAccountAccess()
+	status, raw := ts.call(http.MethodPut, "/server-config/accountAccess",
+		map[string]any{"user": map[string]any{"default": map[string]any{"threshold": 7}}}, nil)
+	ts.Require().Equal(http.StatusOK, status, "the policy must be writable here: %s", raw)
+	defer ts.restoreAccountAccess(original)
+
+	ts.Equal(7, ts.mergedUserThreshold(), "the written threshold must be in force")
+
+	var exported struct {
+		Resources string `json:"resources"`
+	}
+	status, raw = ts.call(http.MethodPost, "/export", map[string]any{"serverConfigs": []string{"accountAccess"}},
+		&exported)
+	ts.Require().Equal(http.StatusOK, status, string(raw))
+	ts.Contains(exported.Resources, "accountAccess", "the export must carry the section")
+	ts.Regexp(`threshold"?:\s*7\b`, exported.Resources, "the export must carry the written policy")
+}
+
+// A Control Plane validates the policy as a server does: an invalid value is refused and the stored
+// section is left as it was.
+func (ts *ControlPlaneTestSuite) TestAnInvalidAccountAccessValueIsRefused() {
+	original := ts.writableAccountAccess()
+	status, raw := ts.call(http.MethodPut, "/server-config/accountAccess",
+		map[string]any{"user": map[string]any{"default": map[string]any{"threshold": 7}}}, nil)
+	ts.Require().Equal(http.StatusOK, status, "the policy must be writable here: %s", raw)
+	defer ts.restoreAccountAccess(original)
+	before := ts.writableAccountAccess()
+
+	status, raw = ts.call(http.MethodPut, "/server-config/accountAccess",
+		map[string]any{"user": map[string]any{"default": map[string]any{"failureWindowSeconds": -1}}}, nil)
+	ts.Equal(http.StatusBadRequest, status, "a negative window must be refused: %s", raw)
+	ts.Contains(string(raw), "SCF-1003", "the refusal must be an invalid value")
+	ts.JSONEq(string(before), string(ts.writableAccountAccess()), "a refused write must change nothing")
+	ts.Equal(7, ts.mergedUserThreshold(), "the stored policy must still be in force")
+}
+
+// writableAccountAccess returns the accountAccess section's writable layer.
+func (ts *ControlPlaneTestSuite) writableAccountAccess() json.RawMessage {
+	ts.T().Helper()
+	var layers struct {
+		Writable json.RawMessage `json:"writable"`
+	}
+	status, raw := ts.call(http.MethodGet, "/server-config/accountAccess", nil, &layers)
+	ts.Require().Equal(http.StatusOK, status, string(raw))
+	if len(layers.Writable) == 0 || string(layers.Writable) == "null" {
+		return json.RawMessage(`{}`)
+	}
+	return layers.Writable
+}
+
+// restoreAccountAccess puts the accountAccess section's writable layer back as it was.
+func (ts *ControlPlaneTestSuite) restoreAccountAccess(layer json.RawMessage) {
+	status, raw := ts.call(http.MethodPut, "/server-config/accountAccess", layer, nil)
+	ts.Equal(http.StatusOK, status, "failed to restore the accountAccess section: %s", raw)
+}
+
+// mergedUserThreshold returns the user threshold the accountAccess section resolves to.
+func (ts *ControlPlaneTestSuite) mergedUserThreshold() int {
+	ts.T().Helper()
+	var layers struct {
+		Merged struct {
+			User struct {
+				Default struct {
+					Threshold int `json:"threshold"`
+				} `json:"default"`
+			} `json:"user"`
+		} `json:"merged"`
+	}
+	status, raw := ts.call(http.MethodGet, "/server-config/accountAccess", nil, &layers)
+	ts.Require().Equal(http.StatusOK, status, string(raw))
+	return layers.Merged.User.Default.Threshold
+}
+
 // A token from the trusted issuer is accepted only when it carries the system scope.
 func (ts *ControlPlaneTestSuite) TestATokenWithoutTheSystemScopeIsRefused() {
 	unscoped := os.Getenv(testutils.UnscopedTokenEnv)

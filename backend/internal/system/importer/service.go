@@ -1050,6 +1050,8 @@ func (s *importService) importApplication(
 		}
 	}
 
+	warnIgnoredEntityState(ctx, doc, resourceTypeApplication, req.ID, req.Name)
+
 	if mappedFlowID, ok := flowIDAliases[req.AuthFlowID]; ok {
 		req.AuthFlowID = mappedFlowID
 	}

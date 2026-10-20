@@ -590,8 +590,6 @@ configuration:
         onLock:
           email:
             enabled: true
-            # User attribute holding the address the lock email is sent to.
-            recipientAttribute: "email"
     agent:
       lockGranularity: "authentication_method"
       recordLastLogin: false

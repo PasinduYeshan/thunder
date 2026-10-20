@@ -6,6 +6,7 @@ package user
 import (
 	"encoding/json"
 
+	"github.com/thunder-id/thunderid/internal/identitygovernance"
 	"github.com/thunder-id/thunderid/internal/system/cryptolib"
 	"github.com/thunder-id/thunderid/internal/system/utils"
 	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
@@ -82,7 +83,7 @@ type CreateUserByPathRequest struct {
 	Attributes json.RawMessage `json:"attributes,omitempty"`
 }
 
-// entityToUser converts an Entity to a User.
+// entityToUser converts an Entity to a User, without its access status.
 func entityToUser(e *providers.Entity) providers.User {
 	return providers.User{
 		ID:         e.ID,
@@ -93,11 +94,32 @@ func entityToUser(e *providers.Entity) providers.User {
 	}
 }
 
+// applyAccess sets the access facts governance derived for the user. A nil read reports no status.
+func applyAccess(user *providers.User, access *identitygovernance.AccessRead) {
+	if access != nil {
+		user.Status = &access.Status
+		user.LastLoginAt = access.LastLoginAt
+	}
+}
+
 // entitiesToUsers converts a slice of Entity to a slice of User.
 func entitiesToUsers(entities []providers.Entity) []providers.User {
 	users := make([]providers.User, len(entities))
 	for i := range entities {
 		users[i] = entityToUser(&entities[i])
+	}
+	return users
+}
+
+// entitiesToUsersWithAccess converts entities to users with the access facts governance derived for
+// them, in the same order. Without reads no status is reported.
+func entitiesToUsersWithAccess(reads []identitygovernance.AccessRead,
+	entities []providers.Entity) []providers.User {
+	users := entitiesToUsers(entities)
+	for i := range users {
+		if i < len(reads) {
+			applyAccess(&users[i], &reads[i])
+		}
 	}
 	return users
 }

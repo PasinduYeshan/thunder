@@ -14,6 +14,7 @@ import (
 	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
 
 	"github.com/thunder-id/thunderid/internal/entityprovider"
+	"github.com/thunder-id/thunderid/internal/identitygovernance"
 	"github.com/thunder-id/thunderid/internal/resource"
 	serverconst "github.com/thunder-id/thunderid/internal/system/constants"
 	"github.com/thunder-id/thunderid/internal/system/log"
@@ -32,10 +33,12 @@ type AuthZENServiceInterface interface {
 		*AccessSearchResponse, *tidcommon.ServiceError)
 }
 
-// authzenService adapts AuthZEN requests to Thunder authorization services.
+// authzenService adapts AuthZEN requests to Thunder authorization services. governance is optional;
+// nil denies no subject for being suspended.
 type authzenService struct {
 	authzService    providers.AuthorizationProvider
 	entityProvider  entityprovider.EntityProviderInterface
+	governance      identitygovernance.IdentityGovernanceServiceInterface
 	resourceService resource.ResourceServiceInterface
 	logger          *log.Logger
 }
@@ -44,11 +47,13 @@ type authzenService struct {
 func newService(
 	authzService providers.AuthorizationProvider,
 	entityProvider entityprovider.EntityProviderInterface,
+	governance identitygovernance.IdentityGovernanceServiceInterface,
 	resourceService resource.ResourceServiceInterface,
 ) AuthZENServiceInterface {
 	return &authzenService{
 		authzService:    authzService,
 		entityProvider:  entityProvider,
+		governance:      governance,
 		resourceService: resourceService,
 		logger:          log.GetLogger().With(log.String(log.LoggerKeyComponentName, "AuthZENService")),
 	}
@@ -66,6 +71,14 @@ func (s *authzenService) EvaluateAccess(ctx context.Context, request AccessEvalu
 		return nil, svcErr
 	}
 	request.Subject = resolvedSubject
+
+	suspended, svcErr := s.isSuspended(ctx, request.Subject.ID)
+	if svcErr != nil {
+		return nil, svcErr
+	}
+	if suspended {
+		return &AccessEvaluationResponse{Decision: false, Context: buildSuspendedSubjectContext()}, nil
+	}
 
 	resourceServerID, svcErr := s.resolveResourceServerID(ctx, request.Resource.Type)
 	if svcErr != nil {
@@ -118,6 +131,7 @@ func (s *authzenService) EvaluateAccessBatch(ctx context.Context, request Access
 	responses := make([]AccessEvaluationResponse, len(request.Evaluations))
 	authzEvaluationIndexes := make([]int, 0, len(request.Evaluations))
 	groupIDsBySubject := make(map[string][]string)
+	suspendedBySubject := make(map[string]bool)
 	resourceServerIDsByIdentifier := make(map[string]string)
 	resolvedSubjects := make(map[string]Subject)
 	validActions := make(map[string]struct{})
@@ -165,6 +179,20 @@ func (s *authzenService) EvaluateAccessBatch(ctx context.Context, request Access
 			resolvedSubjects[subjectKey] = resolvedSubject
 		}
 		evaluation.Subject = resolvedSubject
+
+		suspended, ok := suspendedBySubject[evaluation.Subject.ID]
+		if !ok {
+			var svcErr *tidcommon.ServiceError
+			suspended, svcErr = s.isSuspended(ctx, evaluation.Subject.ID)
+			if svcErr != nil {
+				return nil, svcErr
+			}
+			suspendedBySubject[evaluation.Subject.ID] = suspended
+		}
+		if suspended {
+			responses[i] = AccessEvaluationResponse{Decision: false, Context: buildSuspendedSubjectContext()}
+			continue
+		}
 
 		actionKey := resourceServerID + ":" + evaluation.Action.Name
 		if _, ok := validActions[actionKey]; !ok {
@@ -243,6 +271,14 @@ func (s *authzenService) SearchActions(ctx context.Context, request AccessAction
 		return nil, svcErr
 	}
 	request.Subject = resolvedSubject
+
+	suspended, svcErr := s.isSuspended(ctx, request.Subject.ID)
+	if svcErr != nil {
+		return nil, svcErr
+	}
+	if suspended {
+		return &AccessSearchResponse{Results: []Action{}}, nil
+	}
 
 	resourceServerID, svcErr := s.resolveResourceServerID(ctx, request.Resource.Type)
 	if svcErr != nil {
@@ -439,7 +475,7 @@ func (s *authzenService) resolveSubject(ctx context.Context, subject Subject) (S
 	if s.entityProvider == nil {
 		return subject, nil
 	}
-	entity, err := s.entityProvider.GetEntity(subject.ID)
+	entity, err := s.entityProvider.GetEntityProfile(subject.ID)
 	if err != nil {
 		if err.Code == entityprovider.ErrorCodeNotImplemented {
 			return subject, nil
@@ -463,6 +499,24 @@ func (s *authzenService) resolveSubject(ctx context.Context, subject Subject) (S
 		return Subject{}, &ErrorInvalidSubject
 	}
 	return subject, nil
+}
+
+// isSuspended reports whether governance holds the subject suspended. A lock is not a denial.
+func (s *authzenService) isSuspended(ctx context.Context, subjectID string) (bool, *tidcommon.ServiceError) {
+	if s.governance == nil {
+		return false, nil
+	}
+	// The caller's context is enough: the check reads the stored state and authorizes nothing.
+	suspended, svcErr := s.governance.IsSuspended(ctx, subjectID)
+	if svcErr != nil {
+		// The governance service has logged the cause.
+		return false, &tidcommon.InternalServerError
+	}
+	if suspended {
+		s.logger.Debug(ctx, "Denied access evaluation for a suspended subject",
+			log.MaskedString(log.LoggerKeyUserID, subjectID))
+	}
+	return suspended, nil
 }
 
 // validateAction verifies that an action is registered on the resource server.
@@ -595,6 +649,13 @@ func buildDecisionContext(decision bool, context map[string]interface{}) map[str
 	}
 	return map[string]interface{}{
 		"reason": "Subject is not authorized to perform the requested action",
+	}
+}
+
+// buildSuspendedSubjectContext returns the denial context for a suspended subject.
+func buildSuspendedSubjectContext() map[string]interface{} {
+	return map[string]interface{}{
+		"reason": "Subject is suspended",
 	}
 }
 

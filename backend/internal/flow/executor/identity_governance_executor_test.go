@@ -1,0 +1,450 @@
+// Copyright 2026 The ThunderID Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package executor
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/thunder-id/thunderid/internal/flow/common"
+	"github.com/thunder-id/thunderid/internal/flow/core"
+	"github.com/thunder-id/thunderid/internal/revocation"
+	"github.com/thunder-id/thunderid/internal/system/cache"
+	"github.com/thunder-id/thunderid/internal/system/config"
+	"github.com/thunder-id/thunderid/internal/system/security"
+	tidcommon "github.com/thunder-id/thunderid/pkg/thunderidengine/common"
+	"github.com/thunder-id/thunderid/pkg/thunderidengine/providers"
+	"github.com/thunder-id/thunderid/tests/mocks/identitygovernanceprovidermock"
+)
+
+// IdentityGovernanceExecutorTestSuite covers the administrative lifecycle executor: one executor,
+// three modes. The suspend plan is PreSuspendExecutor's; see pre_suspend_executor_test.go.
+type IdentityGovernanceExecutorTestSuite struct {
+	suite.Suite
+	governance *identitygovernanceprovidermock.IdentityGovernanceProviderMock
+	executor   *identityGovernanceExecutor
+}
+
+func TestIdentityGovernanceExecutorTestSuite(t *testing.T) {
+	suite.Run(t, new(IdentityGovernanceExecutorTestSuite))
+}
+
+func (s *IdentityGovernanceExecutorTestSuite) SetupTest() {
+	s.Require().NoError(config.InitializeServerRuntime(s.T().TempDir(), &config.Config{}))
+	s.governance = identitygovernanceprovidermock.NewIdentityGovernanceProviderMock(s.T())
+	s.executor = s.newExecutor(s.governance)
+}
+
+// newExecutor builds the executor over a freshly initialized flow factory.
+func (s *IdentityGovernanceExecutorTestSuite) newExecutor(
+	governance providers.IdentityGovernanceProvider) *identityGovernanceExecutor {
+	flowFactory, _ := core.Initialize(
+		cache.Initialize(config.GetServerRuntime().Config.Cache, "test-deployment"))
+	return newIdentityGovernanceExecutor(flowFactory, governance)
+}
+
+func (s *IdentityGovernanceExecutorTestSuite) TearDownTest() {
+	config.ResetServerRuntime()
+}
+
+// governanceContext builds the context an administration flow hands this node: a mode from the node
+// definition and the subject as a declared input.
+func governanceContext(mode, subject string) *providers.NodeContext {
+	return &providers.NodeContext{
+		Context:      context.Background(),
+		ExecutionID:  "flow-1",
+		FlowType:     providers.FlowTypeAdministration,
+		ExecutorMode: mode,
+		UserInputs:   map[string]string{revocationInputSubject: subject},
+	}
+}
+
+// governanceContextWithNote is the same, plus the optional operator note a suspend node may collect.
+func governanceContextWithNote(mode, subject, operatorNote string) *providers.NodeContext {
+	ctx := governanceContext(mode, subject)
+	ctx.UserInputs[governanceInputOperatorNote] = operatorNote
+	return ctx
+}
+
+// governanceSuspendContext builds what a suspend node sees after PreSuspendExecutor: the trusted plan naming
+// u1, and no subject input of its own.
+func governanceSuspendContext(operatorNote string) *providers.NodeContext {
+	plan, _ := encodeRevocationPlan(buildSuspensionPlan("u1", "", time.Now(), 0))
+	ctx := governanceContext(governanceModeSuspend, "")
+	delete(ctx.UserInputs, revocationInputSubject)
+	if operatorNote != "" {
+		ctx.UserInputs[governanceInputOperatorNote] = operatorNote
+	}
+	ctx.SharedRuntimeData = map[string]string{common.RuntimeKeyRevocationPlan: plan}
+	return ctx
+}
+
+// adminOperation is one lifecycle mode an administration flow runs on u1, with the port call it
+// expects answered by the given error.
+type adminOperation struct {
+	mode   string
+	expect func(governance *identitygovernanceprovidermock.IdentityGovernanceProviderMock,
+		svcErr *tidcommon.ServiceError)
+	ctx func() *providers.NodeContext
+}
+
+// adminOperations are the three modes, each expecting only its own port call.
+func adminOperations() []adminOperation {
+	return []adminOperation{
+		{
+			mode: governanceModeUnlock,
+			expect: func(governance *identitygovernanceprovidermock.IdentityGovernanceProviderMock,
+				svcErr *tidcommon.ServiceError) {
+				governance.EXPECT().Unlock(mock.Anything, "u1").Return(svcErr).Once()
+			},
+			ctx: func() *providers.NodeContext { return governanceContext(governanceModeUnlock, "u1") },
+		},
+		{
+			mode: governanceModeUnsuspend,
+			expect: func(governance *identitygovernanceprovidermock.IdentityGovernanceProviderMock,
+				svcErr *tidcommon.ServiceError) {
+				governance.EXPECT().Unsuspend(mock.Anything, "u1").Return(svcErr).Once()
+			},
+			ctx: func() *providers.NodeContext { return governanceContext(governanceModeUnsuspend, "u1") },
+		},
+		{
+			mode: governanceModeSuspend,
+			expect: func(governance *identitygovernanceprovidermock.IdentityGovernanceProviderMock,
+				svcErr *tidcommon.ServiceError) {
+				governance.EXPECT().Suspend(mock.Anything, "u1", "").Return(svcErr).Once()
+			},
+			ctx: func() *providers.NodeContext { return governanceSuspendContext("") },
+		},
+	}
+}
+
+// Each mode calls its own method and nothing else. One executor for the three is only safe if the
+// dispatch is exact.
+func (s *IdentityGovernanceExecutorTestSuite) TestEachModeCallsItsOwnOperation() {
+	for _, op := range adminOperations() {
+		s.Run(op.mode, func() {
+			governance := identitygovernanceprovidermock.NewIdentityGovernanceProviderMock(s.T())
+			executor := s.newExecutor(governance)
+			op.expect(governance, nil)
+
+			execResp, err := executor.Execute(op.ctx())
+			s.Require().NoError(err)
+			s.Equal(providers.ExecComplete, execResp.Status)
+			s.Equal("u1", execResp.RuntimeData[userAttributeUserID])
+		})
+	}
+}
+
+// The operator's note reaches the port verbatim, and an absent one crosses as empty. The note is
+// optional, so a suspend node that collects none is complete.
+func (s *IdentityGovernanceExecutorTestSuite) TestTheOperatorNoteReachesThePort() {
+	s.governance.EXPECT().Suspend(mock.Anything, "u1", "Credential exposure").Return(nil).Once()
+
+	execResp, err := s.executor.Execute(governanceSuspendContext("Credential exposure"))
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, execResp.Status)
+}
+
+func (s *IdentityGovernanceExecutorTestSuite) TestSuspendWithoutAnOperatorNoteIsComplete() {
+	s.governance.EXPECT().Suspend(mock.Anything, "u1", "").Return(nil).Once()
+
+	execResp, err := s.executor.Execute(governanceSuspendContext(""))
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, execResp.Status)
+}
+
+// The note input is consumed on every mode, not only on suspend. An input a node leaves unconsumed
+// is re-prompted by the engine, so an unsuspend flow carrying a stray note would loop.
+func (s *IdentityGovernanceExecutorTestSuite) TestTheOperatorNoteInputIsConsumedOnEveryMode() {
+	s.governance.EXPECT().Unsuspend(mock.Anything, "u1").Return(nil).Once()
+
+	ctx := governanceContextWithNote(governanceModeUnsuspend, "u1", "ignored here")
+	execResp, err := s.executor.Execute(ctx)
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, execResp.Status)
+	s.Contains(ctx.GetConsumedInputs(), governanceInputOperatorNote,
+		"an input the node does not mark consumed is re-prompted")
+}
+
+// A suspend writes the hold on the subject the trusted plan names, never on a subject input: the
+// hold must land on exactly the identity the containment nodes acted on.
+func (s *IdentityGovernanceExecutorTestSuite) TestSuspendTakesItsTargetFromThePlan() {
+	s.governance.EXPECT().Suspend(mock.Anything, "u1", "").Return(nil).Once()
+
+	ctx := governanceSuspendContext("")
+	ctx.UserInputs[revocationInputSubject] = "someone-else"
+	execResp, err := s.executor.Execute(ctx)
+
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, execResp.Status)
+	s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, "someone-else", mock.Anything)
+}
+
+// A suspend node with no PreSuspendExecutor ahead of it is a malformed flow, and it faults rather
+// than writing a hold nothing contained.
+func (s *IdentityGovernanceExecutorTestSuite) TestSuspendWithoutAPlanFaults() {
+	_, err := s.executor.Execute(governanceContext(governanceModeSuspend, "u1"))
+
+	s.Require().Error(err)
+	s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// A plan another action's preparatory node published, or one naming no target, is not a suspension
+// plan, so the suspend faults rather than guessing a target.
+func (s *IdentityGovernanceExecutorTestSuite) TestSuspendWithAForeignOrTargetlessPlanFaults() {
+	for name, test := range map[string]struct {
+		plan revocationPlan
+		want string
+	}{
+		"foreign": {revocationPlan{
+			Criteria: []revocation.Criterion{{Type: revocation.CriterionTypeApplicationKey, Value: "client-1"}},
+			Reason:   revocation.ReasonApplicationDeleted,
+			TargetID: "app-1",
+		}, "not \"identity_suspended\""},
+		"targetless": {revocationPlan{
+			Criteria: []revocation.Criterion{{Type: revocation.CriterionTypeSubject, Value: "u1"}},
+			Reason:   revocation.ReasonIdentitySuspended,
+		}, "no target"},
+	} {
+		s.Run(name, func() {
+			plan, err := encodeRevocationPlan(test.plan)
+			s.Require().NoError(err)
+			ctx := governanceContext(governanceModeSuspend, "u1")
+			ctx.SharedRuntimeData = map[string]string{common.RuntimeKeyRevocationPlan: plan}
+
+			_, err = s.executor.Execute(ctx)
+
+			s.Require().ErrorContains(err, test.want)
+			s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// No mode publishes a plan. A flow for unlock or unsuspend carries no revocation nodes, and an
+// unsuspend does not withdraw the revocation a suspend recorded.
+func (s *IdentityGovernanceExecutorTestSuite) TestUnlockAndUnsuspendPublishNoPlan() {
+	for _, op := range adminOperations()[:2] {
+		s.Run(op.mode, func() {
+			governance := identitygovernanceprovidermock.NewIdentityGovernanceProviderMock(s.T())
+			executor := s.newExecutor(governance)
+			op.expect(governance, nil)
+
+			execResp, err := executor.Execute(op.ctx())
+			s.Require().NoError(err)
+			s.Empty(execResp.SharedRuntimeData,
+				"%s must not revoke anything that was already issued", op.mode)
+		})
+	}
+}
+
+// An omitted mode refuses, and the executor declares no default mode, so a flow omitting it cannot
+// be saved.
+func (s *IdentityGovernanceExecutorTestSuite) TestAnOmittedModeRefuses() {
+	_, err := s.executor.Execute(governanceContext("", "u1"))
+	s.Require().Error(err)
+	s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// The subject is published under the shared key, so a following node, such as a notification, can
+// resolve who was governed.
+func (s *IdentityGovernanceExecutorTestSuite) TestTheGovernedSubjectIsPublishedForLaterNodes() {
+	s.governance.EXPECT().Suspend(mock.Anything, "u1", "").Return(nil).Once()
+
+	execResp, err := s.executor.Execute(governanceSuspendContext(""))
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, execResp.Status)
+	s.Equal("u1", execResp.RuntimeData[userAttributeUserID])
+}
+
+// The other half of the same guarantee: with no declared default, flow validation rejects a node
+// that omits the mode, so the runtime refusal above is a backstop rather than the enforcement.
+func (s *IdentityGovernanceExecutorTestSuite) TestTheExecutorDeclaresNoDefaultMode() {
+	meta := s.executor.GetMeta()
+	s.Require().NotNil(meta)
+	s.Empty(meta.DefaultMode)
+	s.ElementsMatch([]string{
+		governanceModeUnlock, governanceModeSuspend, governanceModeUnsuspend,
+	}, meta.SupportedModes)
+}
+
+// An unsupported mode refuses rather than defaulting. This backstops flows persisted before the
+// mode was validated.
+func (s *IdentityGovernanceExecutorTestSuite) TestAnUnsupportedModeRefuses() {
+	_, err := s.executor.Execute(governanceContext("delete", "u1"))
+	s.Require().Error(err)
+	s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// No subject is a flow-definition error, not a client error: the flow is supposed to have resolved
+// one before this node runs.
+func (s *IdentityGovernanceExecutorTestSuite) TestAMissingSubjectIsAnError() {
+	_, err := s.executor.Execute(governanceContext(governanceModeUnsuspend, ""))
+	s.Require().Error(err)
+	s.governance.AssertNotCalled(s.T(), "Unsuspend", mock.Anything, mock.Anything)
+}
+
+// A refused write fails the node and publishes no subject, so the flow stops before it notifies
+// anyone.
+func (s *IdentityGovernanceExecutorTestSuite) TestARefusedOperationFailsTheNode() {
+	for _, op := range adminOperations() {
+		s.Run(op.mode, func() {
+			governance := identitygovernanceprovidermock.NewIdentityGovernanceProviderMock(s.T())
+			executor := s.newExecutor(governance)
+			op.expect(governance, &tidcommon.ErrorUnauthorized)
+
+			execResp, err := executor.Execute(op.ctx())
+			s.Require().NoError(err)
+			s.Equal(providers.ExecFailure, execResp.Status)
+			s.Equal(ErrIdentityGovernanceFailed.Code, execResp.Error.Code)
+			s.Empty(execResp.RuntimeData)
+			s.Empty(execResp.SharedRuntimeData)
+		})
+	}
+}
+
+// A server error is a fault, not a refusal.
+func (s *IdentityGovernanceExecutorTestSuite) TestAFailedOperationIsAFault() {
+	for _, op := range adminOperations() {
+		s.Run(op.mode, func() {
+			governance := identitygovernanceprovidermock.NewIdentityGovernanceProviderMock(s.T())
+			executor := s.newExecutor(governance)
+			op.expect(governance, &tidcommon.InternalServerError)
+
+			execResp, err := executor.Execute(op.ctx())
+			s.Require().Error(err)
+			s.Nil(execResp)
+		})
+	}
+}
+
+// An unwired authority is a flow-engine wiring fault, and it must not read as a completed operation.
+func (s *IdentityGovernanceExecutorTestSuite) TestNoAuthorityIsAnError() {
+	executor := s.newExecutor(nil)
+
+	_, err := executor.Execute(governanceSuspendContext(""))
+	s.Require().Error(err)
+}
+
+// recoveryUnlockContext builds the context a recovery flow hands an unlock node. provenSubject is
+// what an earlier executor recorded, and subjectInput is what a flow author may have left on the node.
+func recoveryUnlockContext(provenSubject, subjectInput string) *providers.NodeContext {
+	ctx := &providers.NodeContext{
+		Context:      context.Background(),
+		ExecutionID:  "flow-recovery-1",
+		FlowType:     providers.FlowTypeRecovery,
+		ExecutorMode: governanceModeUnlock,
+		UserInputs:   map[string]string{},
+	}
+	if subjectInput != "" {
+		ctx.UserInputs[revocationInputSubject] = subjectInput
+	}
+	if provenSubject != "" {
+		ctx.SharedRuntimeData = map[string]string{common.RuntimeKeyProvenSubject: provenSubject}
+	}
+	return ctx
+}
+
+// A recovery flow releases the identity an earlier node proved control of.
+func (s *IdentityGovernanceExecutorTestSuite) TestARecoveryFlowUnlocksTheProvenSubject() {
+	s.governance.EXPECT().Unlock(mock.Anything, "user-proven").Return(nil).Once()
+
+	resp, err := s.executor.Execute(recoveryUnlockContext("user-proven", ""))
+
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, resp.Status)
+	s.Equal("user-proven", resp.RuntimeData[userAttributeUserID])
+}
+
+// A refused release in a recovery flow fails the node and publishes no subject.
+func (s *IdentityGovernanceExecutorTestSuite) TestARefusedRecoveryUnlockFailsTheNode() {
+	s.governance.EXPECT().Unlock(mock.Anything, "user-proven").Return(&tidcommon.ErrorUnauthorized).Once()
+
+	resp, err := s.executor.Execute(recoveryUnlockContext("user-proven", ""))
+
+	s.Require().NoError(err)
+	s.Equal(providers.ExecFailure, resp.Status)
+	s.Equal(ErrIdentityGovernanceFailed.Code, resp.Error.Code)
+	s.Empty(resp.RuntimeData)
+}
+
+// A server error releasing in a recovery flow is a fault.
+func (s *IdentityGovernanceExecutorTestSuite) TestAFailedRecoveryUnlockIsAFault() {
+	s.governance.EXPECT().Unlock(mock.Anything, "user-proven").Return(&tidcommon.InternalServerError).Once()
+
+	resp, err := s.executor.Execute(recoveryUnlockContext("user-proven", ""))
+
+	s.Require().Error(err)
+	s.Nil(resp)
+}
+
+// A recovery flow ignores a supplied subject input: the caller is unauthenticated, so trusting it
+// would let anyone release any account they can name.
+func (s *IdentityGovernanceExecutorTestSuite) TestARecoveryFlowIgnoresASuppliedSubject() {
+	s.governance.EXPECT().Unlock(mock.Anything, "user-proven").Return(nil).Once()
+
+	resp, err := s.executor.Execute(recoveryUnlockContext("user-proven", "someone-elses-account"))
+
+	s.Require().NoError(err)
+	s.Equal(providers.ExecComplete, resp.Status)
+	s.governance.AssertNotCalled(s.T(), "Unlock", mock.Anything, "someone-elses-account")
+}
+
+// No proof, no release, so an unlock node placed before the proving step, after identification but
+// before the credential write, is not a way in.
+func (s *IdentityGovernanceExecutorTestSuite) TestARecoveryFlowWithoutProofReleasesNothing() {
+	resp, err := s.executor.Execute(recoveryUnlockContext("", "user-1"))
+
+	s.Require().NoError(err)
+	s.Equal(providers.ExecFailure, resp.Status)
+	s.Equal(ErrIdentityGovernanceFailed.Code, resp.Error.Code)
+	s.governance.AssertNotCalled(s.T(), "Unlock", mock.Anything, mock.Anything)
+}
+
+// The self-service release carries runtime privilege, since there is no operator to authorize it;
+// the proof consumed earlier is what earns it.
+func (s *IdentityGovernanceExecutorTestSuite) TestTheSelfServiceReleaseCarriesRuntimePrivilege() {
+	var privileged bool
+	s.governance.EXPECT().Unlock(mock.Anything, "user-proven").
+		Run(func(callCtx context.Context, _ string) {
+			privileged = security.IsRuntimeContext(callCtx)
+		}).Return(nil).Once()
+
+	_, err := s.executor.Execute(recoveryUnlockContext("user-proven", ""))
+
+	s.Require().NoError(err)
+	s.True(privileged, "a self-service release must reach the authority with runtime privilege")
+}
+
+// An administration flow does not, so the boundary check runs against the operator.
+func (s *IdentityGovernanceExecutorTestSuite) TestAnAdministrativeOperationKeepsTheCallersContext() {
+	var privileged bool
+	s.governance.EXPECT().Unlock(mock.Anything, "user-1").
+		Run(func(callCtx context.Context, _ string) {
+			privileged = security.IsRuntimeContext(callCtx)
+		}).Return(nil).Once()
+
+	_, err := s.executor.Execute(governanceContext(governanceModeUnlock, "user-1"))
+
+	s.Require().NoError(err)
+	s.False(privileged, "an operator's lifecycle call must not be elevated past their own authority")
+}
+
+// Only unlock is reachable from a recovery flow; suspend from an unauthenticated flow would be a
+// denial-of-service primitive.
+func (s *IdentityGovernanceExecutorTestSuite) TestSuspendAndUnsuspendAreAdministrationOnly() {
+	for _, mode := range []string{governanceModeSuspend, governanceModeUnsuspend} {
+		ctx := recoveryUnlockContext("user-proven", "")
+		ctx.ExecutorMode = mode
+
+		_, err := s.executor.Execute(ctx)
+
+		s.Error(err, "%s must not be reachable from a recovery flow", mode)
+	}
+	s.governance.AssertNotCalled(s.T(), "Suspend", mock.Anything, mock.Anything, mock.Anything)
+	s.governance.AssertNotCalled(s.T(), "Unsuspend", mock.Anything, mock.Anything)
+}

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/thunder-id/thunderid/internal/serverconfig"
+	"github.com/thunder-id/thunderid/tests/mocks/entitytypemock"
 	"github.com/thunder-id/thunderid/tests/mocks/notification/notificationmock"
 	"github.com/thunder-id/thunderid/tests/mocks/serverconfigmock"
 )
@@ -45,9 +46,9 @@ func (s *InitTestSuite) TestInitializeWithoutNotificationsBuildsTheService() {
 func (s *InitTestSuite) TestStopClosesTheNotifier() {
 	svc, _, stop, err := Initialize(newEntityStateProviderMock(s.T()), Config{},
 		&NotificationDependencies{
-			Templates:     newNotificationTemplateRendererMock(s.T()),
-			Senders:       notificationmock.NewNotificationSenderServiceInterfaceMock(s.T()),
-			DefaultSender: newDefaultEmailSenderSourceMock(s.T()),
+			Templates:   newNotificationTemplateRendererMock(s.T()),
+			Senders:     notificationmock.NewNotificationSenderServiceInterfaceMock(s.T()),
+			EntityTypes: entitytypemock.NewEntityTypeServiceInterfaceMock(s.T()),
 		}, nil, nil)
 	s.Require().NoError(err)
 
@@ -68,7 +69,7 @@ func (s *InitTestSuite) TestInitializeReturnsTheHandlerOverTheDeploymentBase() {
 	merged, ok := handler.Merge(nil, accountAccessValue{}).(accountAccessValue)
 
 	s.Require().True(ok)
-	s.Equal(effectiveAccountAccess(testAccountAccessConfig(), accountAccessValue{}), merged)
+	s.Equal(testAccountAccessConfig(), merged)
 }
 
 // The deployment configuration applies until the server-config service is set; then the section does.
@@ -77,8 +78,7 @@ func (s *InitTestSuite) TestTheSectionIsReadOnceTheServerConfigServiceIsSet() {
 		Config{AccountAccess: testAccountAccessConfig()}, nil, nil, nil)
 	s.Require().NoError(err)
 	source := svc.(*identityGovernanceService).source
-	s.Equal(effectiveAccountAccess(testAccountAccessConfig(), accountAccessValue{}),
-		source.Current(context.Background()))
+	s.Equal(testAccountAccessConfig(), source.Current(context.Background()))
 
 	section := accountAccessValue{User: &accountAccessCategory{Default: &accountAccessPolicy{Threshold: new(3)}}}
 	reader := serverconfigmock.NewServerConfigServiceMock(s.T())

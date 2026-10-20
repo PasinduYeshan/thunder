@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -826,6 +827,66 @@ func startServerInternal(port string, extraArgs ...string) error {
 	return nil
 }
 
+// StartServerExpectingExit stops the running server and starts one that is expected to refuse its
+// configuration and exit. It returns nil once the process has exited, and an error if the server
+// stays up for the timeout, in which case it is stopped. Call RestartServer to run normally again.
+func StartServerExpectingExit(timeout time.Duration) error {
+	ensureInitialized()
+	StopServer()
+	if err := waitForPortClosed(serverPort, restartReadyTimeout); err != nil {
+		return err
+	}
+
+	if err := startServerInternal(serverPort); err != nil {
+		return err
+	}
+	cmd := serverCmd
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	defer func() {
+		serverCmd = nil
+		serverPid = 0
+		removePidFile()
+	}()
+
+	select {
+	case <-exited:
+		return nil
+	case <-time.After(timeout):
+	}
+
+	// The goroutine above is the process's only waiter, so the stop is awaited on its channel.
+	if err := sendStopSignal(cmd.Process); err != nil {
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		_ = cmd.Process.Kill()
+		<-exited
+	}
+	return fmt.Errorf("the server was still running %s after it started", timeout)
+}
+
+// waitForPortClosed polls until nothing accepts connections on the port, so a new server can bind it.
+func waitForPortClosed(port string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		conn, err := net.DialTimeout("tcp", "localhost:"+port, 500*time.Millisecond)
+		if err != nil {
+			return nil
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) {
+			return fmt.Errorf("port %s still accepted connections %s after the server was stopped", port, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // RestartServerWithResourcesFile stops the running server and restarts it with the -resources flag
 // pointing to the given single-file declarative resources YAML. Call RestartServer to return to
 // normal mode afterwards.
@@ -918,6 +979,10 @@ func StopServer() {
 	}
 }
 
+// restartReadyTimeout bounds how long a restarted server may take to answer liveness. CI also runs
+// the suites on Postgres, where a start takes far longer than the 30 seconds a local SQLite one needs.
+const restartReadyTimeout = 3 * time.Minute
+
 // RestartServer stops the current server and starts a new one with the same configuration.
 func RestartServer() error {
 	ensureInitialized()
@@ -935,7 +1000,7 @@ func RestartServer() error {
 		return fmt.Errorf("failed to restart server: %v", err)
 	}
 
-	if err := waitForServerReady(30 * time.Second); err != nil {
+	if err := waitForServerReady(restartReadyTimeout); err != nil {
 		return fmt.Errorf("server did not become ready after restart: %w", err)
 	}
 

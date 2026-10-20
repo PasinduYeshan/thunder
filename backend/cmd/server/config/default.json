@@ -345,8 +345,7 @@
       "notifications": {
         "on_lock": {
           "email": {
-            "enabled": true,
-            "recipient_attribute": "email"
+            "enabled": true
           }
         }
       }

@@ -36,6 +36,7 @@ type identifyingExecutor struct {
 	providers.Executor
 	entityProvider entityprovider.EntityProviderInterface
 	authnProvider  providers.AuthnProviderManager
+	accessGuard    *accessGuard
 	logger         *log.Logger
 }
 
@@ -51,6 +52,7 @@ func newIdentifyingExecutor(
 	flowFactory core.FlowFactoryInterface,
 	entityProvider entityprovider.EntityProviderInterface,
 	authnProvider providers.AuthnProviderManager,
+	governance providers.IdentityGovernanceProvider,
 ) *identifyingExecutor {
 	if name == "" {
 		name = ExecutorNameIdentifying
@@ -70,6 +72,7 @@ func newIdentifyingExecutor(
 		Executor:       base,
 		entityProvider: entityProvider,
 		authnProvider:  authnProvider,
+		accessGuard:    newAccessGuard(governance, logger),
 		logger:         logger,
 	}
 }
@@ -83,7 +86,7 @@ func (i *identifyingExecutor) IdentifyEntity(ctx context.Context, filters map[st
 	logger.Debug(ctx, "Identifying entity with filters")
 
 	if entityID, ok := filters[userAttributeUserID].(string); ok && entityID != "" {
-		entity, epErr := i.entityProvider.GetEntity(entityID)
+		entity, epErr := i.entityProvider.GetEntityProfile(entityID)
 		if epErr != nil {
 			if epErr.Code == entityprovider.ErrorCodeEntityNotFound {
 				execResp.Error = errForEntityCategory(ErrEntityNotFound, category)
@@ -228,6 +231,35 @@ func (i *identifyingExecutor) executeIdentify(ctx *providers.NodeContext,
 		return execResp, nil
 	}
 
+	// Gate self-service recovery here, as this path never reaches the assertion check. Only recovery
+	// flows are checked, at the recovery plane, and a held account is refused.
+	if ctx.FlowType == providers.FlowTypeRecovery {
+		held, stated, fault := i.accessGuard.heldAt(ctx.Context, *userID, providers.AccessPlaneRecovery, "")
+		if fault != nil {
+			// Answered as the account lookup failing above is; the authority has logged the cause.
+			execResp.Status = providers.ExecFailure
+			execResp.Error = errForEntityCategory(ErrFailedToIdentifyEntity, categoryUnscoped)
+			return execResp, nil
+		}
+		if held {
+			// A stated hold fails the step with its own error; the node's onFailure decides what
+			// follows. A refusal that names no hold takes the unknown-user branch.
+			if stated != nil {
+				execResp.Status = providers.ExecFailure
+				execResp.Error = stated
+				return execResp, nil
+			}
+			if loginHintAttr == "" {
+				execResp.Status = providers.ExecUserInputRequired
+				execResp.Inputs = i.GetRequiredInputs(ctx)
+			} else {
+				execResp.Status = providers.ExecFailure
+			}
+			execResp.Error = errForEntityCategory(ErrEntityNotFound, categoryUnscoped)
+			return execResp, nil
+		}
+	}
+
 	execResp.RuntimeData[userAttributeUserID] = *userID
 	execResp.Status = providers.ExecComplete
 
@@ -363,7 +395,7 @@ func (i *identifyingExecutor) promptLinkHolders(ctx context.Context, holders []*
 }
 
 // bindLinkHolder makes the AuthUser name the link holder the user picked. The holder came from the
-// link itself, so it is authenticated as the provisioning executor authenticates an entity it created.
+// link itself, so it is authenticated by entity ID, which the provider admits as a federated sign-in.
 func (i *identifyingExecutor) bindLinkHolder(ctx *providers.NodeContext, execResp *providers.ExecutorResponse,
 	entityID string, logger *log.Logger) (*providers.ExecutorResponse, error) {
 	if i.authnProvider == nil {
@@ -375,7 +407,11 @@ func (i *identifyingExecutor) bindLinkHolder(ctx *providers.NodeContext, execRes
 		}
 		logger.Debug(ctx.Context, "Failed to bind the resolved link holder", log.String("errorCode", svcErr.Code))
 		execResp.Status = providers.ExecFailure
-		execResp.Error = errForEntityCategory(ErrFailedToIdentifyEntity, categoryUnscoped)
+		if stated := statedHold(svcErr).refusal(); stated != nil {
+			execResp.Error = stated
+		} else {
+			execResp.Error = errForEntityCategory(ErrFailedToIdentifyEntity, categoryUnscoped)
+		}
 		return execResp, nil
 	}
 

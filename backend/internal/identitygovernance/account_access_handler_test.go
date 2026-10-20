@@ -74,6 +74,64 @@ func (s *AccountAccessHandlerTestSuite) TestADisclosureSettingIsRejected() {
 	s.Contains(err.Error(), `unknown field "discloseAccountHold"`)
 }
 
+// The lock email goes only to the user type's primary email, so there is no recipient setting.
+func (s *AccountAccessHandlerTestSuite) TestARecipientAttributeIsRejected() {
+	_, err := s.handler.Decode(json.RawMessage(
+		`{"user":{"notifications":{"onLock":{"email":{"recipientAttribute":"email"}}}}}`))
+	s.Require().Error(err)
+	s.Contains(err.Error(), `unknown field "recipientAttribute"`)
+}
+
+// The lock email templates are set through the section: a default pair, the entity-wide lock's and
+// per-method overrides.
+func (s *AccountAccessHandlerTestSuite) TestTheLockEmailTemplatesAreConfigurableThroughTheSection() {
+	incoming := s.decode(`{"user":{"notifications":{"onLock":{"email":{"templates":{` +
+		`"temporary":"account-locked","permanent":"account-locked-permanent",` +
+		`"entity":{"permanent":"entity-locked-permanent"},"methods":{"otp":{"temporary":"otp-locked"}}}}}}}}`)
+	s.Require().NoError(s.handler.Validate(incoming, nil, nil))
+
+	s.Equal(&accountAccessLockTemplates{
+		accountAccessTemplatePair: accountAccessTemplatePair{
+			Temporary: "account-locked", Permanent: "account-locked-permanent"},
+		Entity:  &accountAccessTemplatePair{Permanent: "entity-locked-permanent"},
+		Methods: map[string]accountAccessTemplatePair{"otp": {Temporary: "otp-locked"}},
+	}, incoming.User.Notifications.lockEmail().Templates)
+}
+
+// The templates block has only its own keys, so the old flat keys are unknown fields.
+func (s *AccountAccessHandlerTestSuite) TestAnUnknownTemplateKeyIsRejected() {
+	for _, email := range []string{
+		`{"template":"account-locked"}`,
+		`{"templates":{"expiring":"account-locked"}}`,
+		`{"templates":{"methods":{"otp":{"template":"otp-locked"}}}}`,
+	} {
+		_, err := s.handler.Decode(json.RawMessage(`{"user":{"notifications":{"onLock":{"email":` + email + `}}}}`))
+		s.Require().Error(err, email)
+		s.Contains(err.Error(), "unknown field", email)
+	}
+}
+
+// A template handle must be a valid handle, and a method override must name a lockable method; the
+// refusal lists the methods that can be set.
+func (s *AccountAccessHandlerTestSuite) TestAnInvalidLockTemplateIsRejected() {
+	const path = "user.notifications.onLock.email.templates"
+	for want, templates := range map[string]string{
+		path + ".temporary is not a valid handle":             `{"temporary":"Not A Handle"}`,
+		path + ".permanent is not a valid handle":             `{"permanent":"a/b"}`,
+		path + ".entity.temporary is not a valid handle":      `{"entity":{"temporary":"Not A Handle"}}`,
+		path + ".methods.otp.permanent is not a valid handle": `{"methods":{"otp":{"permanent":"Not A Handle"}}}`,
+		path + ".methods.passkey is not a lockable authentication method; use credential or otp": `{` +
+			`"methods":{"passkey":{"temporary":"passkey-locked"}}}`,
+		path + ".methods.entity is not a lockable authentication method; use credential or otp": `{` +
+			`"methods":{"entity":{"temporary":"entity-locked"}}}`,
+	} {
+		incoming := s.decode(`{"user":{"notifications":{"onLock":{"email":{"templates":` + templates + `}}}}}`)
+		err := s.handler.Validate(incoming, nil, nil)
+		s.Require().Error(err, want)
+		s.Contains(err.Error(), want)
+	}
+}
+
 func (s *AccountAccessHandlerTestSuite) TestAnUnknownGranularityIsRejected() {
 	incoming := s.decode(`{"user":{"lockGranularity":"entitiy"}}`)
 	s.Require().Error(s.handler.Validate(incoming, nil, nil))
@@ -233,7 +291,7 @@ func (s *AccountAccessHandlerTestSuite) TestNoBaseAndNoSectionHasNoPolicy() {
 func (s *AccountAccessHandlerTestSuite) TestTheBaseAppliesWithNoSection() {
 	merged := s.mergedOverBase(accountAccessValue{}, accountAccessValue{})
 	s.Equal(5, *merged.User.Default.Threshold)
-	s.Equal(effectiveAccountAccess(s.precedence.base, accountAccessValue{}), merged)
+	s.Equal(s.precedence.base, merged)
 }
 
 func (s *AccountAccessHandlerTestSuite) TestWritableOverridesTheBase() {
@@ -299,36 +357,6 @@ func (s *AccountAccessHandlerTestSuite) TestANegativeLastLoginResolutionIsReject
 	err := s.handler.Validate(incoming, nil, nil)
 	s.Require().Error(err)
 	s.Contains(err.Error(), "lastLoginResolutionSeconds")
-}
-
-func (s *AccountAccessHandlerTestSuite) TestEffectiveLockEmailDefaultsWithoutChangingStoredLayer() {
-	for _, recipient := range []string{"", " ", "workEmail"} {
-		s.Run(recipient, func() {
-			enabled := true
-			incoming := notificationValue(&accountAccessLockEmail{
-				Enabled: &enabled, RecipientAttribute: &recipient,
-			})
-			handler := accountAccessHandler{}
-			s.Require().NoError(handler.Validate(incoming, nil, nil))
-			merged := handler.Merge(nil, incoming).(accountAccessValue)
-			want := recipient
-			if recipient == "" || recipient == " " {
-				want = "email"
-			}
-			s.Equal(want, *merged.User.Notifications.lockEmail().RecipientAttribute, "the effective attribute")
-			s.Equal(recipient, *incoming.User.Notifications.lockEmail().RecipientAttribute,
-				"the stored layer is unchanged")
-		})
-	}
-}
-
-// notificationValue builds a section stating only the user notification block.
-func notificationValue(email *accountAccessLockEmail) accountAccessValue {
-	return accountAccessValue{User: &accountAccessCategory{
-		Notifications: &accountAccessNotifications{
-			OnLock: &accountAccessLockNotification{Email: email},
-		},
-	}}
 }
 
 func (s *AccountAccessHandlerTestSuite) TestAWrongValueTypeIsRefused() {

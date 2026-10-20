@@ -1144,6 +1144,15 @@ func testCredentialsJSON() json.RawMessage {
 		`"storageAlgoParams":{"salt":"testsalt","iterations":1,"keySize":32}}]}`)
 }
 
+// twoCandidateCredentialsJSON stores two password candidates, as an entity mid-rehash holds.
+func twoCandidateCredentialsJSON() json.RawMessage {
+	return json.RawMessage(`{"password":[` +
+		`{"value":"brokenhash","storageAlgo":"LEGACY",` +
+		`"storageAlgoParams":{"salt":"s","iterations":1,"keySize":32}},` +
+		`{"value":"testhash","storageAlgo":"PBKDF2",` +
+		`"storageAlgoParams":{"salt":"testsalt","iterations":1,"keySize":32}}]}`)
+}
+
 func (s *ServiceTestSuite) TestAuthenticateEntityByID_Success() {
 	storedCreds := testCredentialsJSON()
 	e := testEntity("auth-id-1")
@@ -1151,8 +1160,10 @@ func (s *ServiceTestSuite) TestAuthenticateEntityByID_Success() {
 		Return(&entityWithCredentials{Entity: e, SchemaCredentials: storedCreds}, nil)
 	s.hashService.On("Verify", []byte("password123"), mock.Anything).Return(true, nil)
 
-	result, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "password123"})
+	result, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "password123"})
 	s.NoError(err)
+	s.Nil(failure, "a successful verification produces no failure evidence")
 	s.Equal(e.ID, result.EntityID)
 	s.Equal(e.Category, result.EntityCategory)
 	s.Equal(e.Type, result.EntityType)
@@ -1160,12 +1171,12 @@ func (s *ServiceTestSuite) TestAuthenticateEntityByID_Success() {
 }
 
 func (s *ServiceTestSuite) TestAuthenticateEntityByID_EmptyID() {
-	_, err := s.svc.AuthenticateEntityByID(s.ctx, "", map[string]interface{}{"password": "p"})
+	_, _, err := s.svc.AuthenticateEntityByID(s.ctx, "", map[string]interface{}{"password": "p"})
 	s.ErrorIs(err, ErrEntityNotFound)
 }
 
 func (s *ServiceTestSuite) TestAuthenticateEntityByID_EmptyCredentials() {
-	_, err := s.svc.AuthenticateEntityByID(s.ctx, "some-id", map[string]interface{}{})
+	_, _, err := s.svc.AuthenticateEntityByID(s.ctx, "some-id", map[string]interface{}{})
 	s.ErrorIs(err, ErrAuthenticationFailed)
 }
 
@@ -1173,20 +1184,21 @@ func (s *ServiceTestSuite) TestAuthenticateEntityByID_EntityNotFound() {
 	s.store.On("GetEntityWithCredentials", mock.Anything, "missing").
 		Return(nil, ErrEntityNotFound)
 
-	_, err := s.svc.AuthenticateEntityByID(s.ctx, "missing", map[string]interface{}{"password": "p"})
+	_, _, err := s.svc.AuthenticateEntityByID(s.ctx, "missing", map[string]interface{}{"password": "p"})
 	s.ErrorIs(err, ErrEntityNotFound)
 }
 
-func (s *ServiceTestSuite) TestAuthenticateEntityByID_DoesNotCheckProfileState() {
+// Whether an identity may be used is the governance authority's question, asked above this layer,
+// so a non-active entity with a correct secret verifies here.
+func (s *ServiceTestSuite) TestAuthenticateEntityByID_DoesNotCheckStateItself() {
 	e := testEntity("inactive-1")
 	e.State = providers.EntityState("SUSPENDED")
 	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
 		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
-
 	s.hashService.On("Verify", []byte("p"), mock.Anything).Return(true, nil)
-	result, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "p"})
-	s.NoError(err)
-	s.Require().NotNil(result)
+
+	result, _, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "p"})
+	s.Require().NoError(err)
 	s.Equal(e.ID, result.EntityID)
 }
 
@@ -1197,8 +1209,11 @@ func (s *ServiceTestSuite) TestAuthenticateEntityByID_WrongCredentials() {
 		Return(&entityWithCredentials{Entity: e, SchemaCredentials: storedCreds}, nil)
 	s.hashService.On("Verify", []byte("wrong"), mock.Anything).Return(false, nil)
 
-	_, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "wrong"})
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
 	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Require().NotNil(failure, "a compared and rejected secret is attributable")
+	s.Equal(e.ID, failure.EntityID)
 }
 
 func (s *ServiceTestSuite) TestAuthenticateEntityByID_VerifyError() {
@@ -1208,7 +1223,7 @@ func (s *ServiceTestSuite) TestAuthenticateEntityByID_VerifyError() {
 		Return(&entityWithCredentials{Entity: e, SchemaCredentials: storedCreds}, nil)
 	s.hashService.On("Verify", []byte("password123"), mock.Anything).Return(false, s.testErr)
 
-	_, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "password123"})
+	_, _, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID, map[string]interface{}{"password": "password123"})
 	s.ErrorIs(err, ErrAuthenticationFailed)
 }
 
@@ -1223,7 +1238,7 @@ func (s *ServiceTestSuite) TestAuthenticateEntity_DelegatesToByID() {
 		Return(&entityWithCredentials{Entity: e, SchemaCredentials: storedCreds}, nil)
 	s.hashService.On("Verify", []byte("pass"), mock.Anything).Return(true, nil)
 
-	result, err := s.svc.AuthenticateEntity(s.ctx, filters, map[string]interface{}{"password": "pass"})
+	result, _, err := s.svc.AuthenticateEntity(s.ctx, filters, map[string]interface{}{"password": "pass"})
 	s.NoError(err)
 	s.Equal(id, result.EntityID)
 }
@@ -1691,6 +1706,212 @@ func (s *ServiceTestSuite) TestUpdateSystemAttributes_NoMarkerPassesThrough() {
 
 	s.NoError(s.svc.UpdateSystemAttributes(s.ctx, e.ID, json.RawMessage(`{"name":"New"}`)))
 	s.JSONEq(`{"name":"New"}`, string(written))
+}
+
+// --- Failure evidence ---
+// Whether a failed verification was proven, and whose it was. The provider does the counting.
+
+// A compared and rejected secret names the entity it was compared against. The evidence rides
+// beside the error, so the error itself still identifies nobody.
+func (s *ServiceTestSuite) TestAWrongCredentialProducesEvidence() {
+	e := testEntity("count-1")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
+	s.hashService.On("Verify", []byte("wrong"), mock.Anything).Return(false, nil)
+
+	result, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(result, "a refusal returns no authenticate result")
+	s.Require().NotNil(failure)
+	s.Equal(e.ID, failure.EntityID)
+}
+
+// The evidence names the entity the comparison ran against, the one the caller resolved, never one
+// re-derived from the request.
+func (s *ServiceTestSuite) TestEvidenceNamesTheComparedEntity() {
+	id := "count-2"
+	e := testEntity(id)
+	filters := map[string]interface{}{"username": "someone"}
+	s.store.On("IdentifyEntity", mock.Anything, filters).Return(&id, nil)
+	s.store.On("GetEntityWithCredentials", mock.Anything, id).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
+	s.hashService.On("Verify", mock.Anything, mock.Anything).Return(false, nil)
+
+	_, failure, err := s.svc.AuthenticateEntity(s.ctx, filters,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Require().NotNil(failure)
+	s.Equal(id, failure.EntityID)
+}
+
+// An identifier naming nobody produces no evidence: nothing was compared and there is no counter.
+func (s *ServiceTestSuite) TestAnUnknownIdentifierProducesNoEvidence() {
+	filters := map[string]interface{}{"username": "ghost"}
+	s.store.On("IdentifyEntity", mock.Anything, filters).Return(nil, ErrEntityNotFound)
+
+	_, failure, err := s.svc.AuthenticateEntity(s.ctx, filters,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrEntityNotFound)
+	s.Nil(failure)
+}
+
+// An entity with no stored credential of the type supplied produces no evidence. The refusal is
+// real, but nothing was compared, so nothing about a secret was proven.
+func (s *ServiceTestSuite) TestNoStoredCredentialOfThatTypeProducesNoEvidence() {
+	e := testEntity("count-3")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"pin": "1234"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
+}
+
+// And an entity holding no credentials at all produces none either.
+func (s *ServiceTestSuite) TestAnEntityWithNoStoredCredentialsProducesNoEvidence() {
+	e := testEntity("count-4")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e}, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
+}
+
+// A credential blob that will not decode produces no evidence. It is a server fault, and counting it
+// would lock an account whose secret nobody guessed.
+func (s *ServiceTestSuite) TestACorruptCredentialBlobProducesNoEvidence() {
+	e := testEntity("count-5")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: json.RawMessage(`not json`)}, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
+	s.Require().Error(err)
+	s.NotErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
+}
+
+// A hash service that could not answer produces no evidence: "could not check" is not "wrong", and
+// counting it would let an outage lock accounts.
+func (s *ServiceTestSuite) TestAnIndeterminateHashServiceProducesNoEvidence() {
+	e := testEntity("count-6")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
+	s.hashService.On("Verify", mock.Anything, mock.Anything).
+		Return(false, errors.New("hash service unavailable"))
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
+}
+
+// Among several stored candidates, a matching one still wins even when another could not be
+// evaluated: the entity keeps authenticating while an old hash sits unreadable beside the live one.
+func (s *ServiceTestSuite) TestAMatchingCandidateWinsOverAnIndeterminateOne() {
+	e := testEntity("count-7")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: twoCandidateCredentialsJSON()}, nil)
+	s.hashService.On("Verify", mock.Anything, mock.MatchedBy(func(c cryptolib.Credential) bool {
+		return c.Hash == "brokenhash"
+	})).Return(false, errors.New("unsupported algorithm"))
+	s.hashService.On("Verify", mock.Anything, mock.MatchedBy(func(c cryptolib.Credential) bool {
+		return c.Hash == "testhash"
+	})).Return(true, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "right"})
+	s.Require().NoError(err)
+	s.Nil(failure)
+}
+
+// But when none of them matched and one was indeterminate, the failure is not proven, so it produces
+// no evidence.
+func (s *ServiceTestSuite) TestNoMatchWithAnIndeterminateCandidateProducesNoEvidence() {
+	e := testEntity("count-8")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: twoCandidateCredentialsJSON()}, nil)
+	s.hashService.On("Verify", mock.Anything, mock.MatchedBy(func(c cryptolib.Credential) bool {
+		return c.Hash == "brokenhash"
+	})).Return(false, errors.New("unsupported algorithm"))
+	s.hashService.On("Verify", mock.Anything, mock.MatchedBy(func(c cryptolib.Credential) bool {
+		return c.Hash == "testhash"
+	})).Return(false, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{"password": "wrong"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
+}
+
+// Two credential types, one provably wrong and one that could not be evaluated: the proven one
+// decides, whichever order the map is read in.
+func (s *ServiceTestSuite) TestAProvenMismatchDecidesOverAnIndeterminateSibling() {
+	e := testEntity("count-11")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{
+			Entity: e,
+			SchemaCredentials: json.RawMessage(`{` +
+				`"password":[{"value":"testhash","storageAlgo":"PBKDF2",` +
+				`"storageAlgoParams":{"salt":"testsalt","iterations":1,"keySize":32}}],` +
+				`"pin":[{"value":"brokenhash","storageAlgo":"LEGACY",` +
+				`"storageAlgoParams":{"salt":"s","iterations":1,"keySize":32}}]}`),
+		}, nil)
+	s.hashService.On("Verify", []byte("wrong"), mock.Anything).Return(false, nil)
+	// Maybe, and that is the assertion's companion: the proven mismatch short-circuits, so whether
+	// the unevaluable sibling is reached at all depends on map order. The verdict must not.
+	s.hashService.On("Verify", []byte("0000"), mock.Anything).
+		Return(false, errors.New("unsupported algorithm")).Maybe()
+
+	for range 8 {
+		_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+			map[string]interface{}{"password": "wrong", "pin": "0000"})
+		s.ErrorIs(err, ErrAuthenticationFailed)
+		s.Require().NotNil(failure, "a proven mismatch must decide regardless of map order")
+		s.Equal(e.ID, failure.EntityID)
+	}
+}
+
+// And a correct secret beside an unevaluable one still refuses, with no evidence: every supplied
+// credential that has a stored counterpart has to verify, and one of them could not be checked.
+func (s *ServiceTestSuite) TestACorrectSecretBesideAnIndeterminateOneProducesNoEvidence() {
+	e := testEntity("count-12")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{
+			Entity: e,
+			SchemaCredentials: json.RawMessage(`{` +
+				`"password":[{"value":"testhash","storageAlgo":"PBKDF2",` +
+				`"storageAlgoParams":{"salt":"testsalt","iterations":1,"keySize":32}}],` +
+				`"pin":[{"value":"brokenhash","storageAlgo":"LEGACY",` +
+				`"storageAlgoParams":{"salt":"s","iterations":1,"keySize":32}}]}`),
+		}, nil)
+	s.hashService.On("Verify", []byte("right"), mock.Anything).Return(true, nil)
+	s.hashService.On("Verify", []byte("0000"), mock.Anything).
+		Return(false, errors.New("unsupported algorithm"))
+
+	for range 8 {
+		_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+			map[string]interface{}{"password": "right", "pin": "0000"})
+		s.ErrorIs(err, ErrAuthenticationFailed)
+		s.Nil(failure)
+	}
+}
+
+// A step that verifies no secret produces no evidence. Provisioning an entity earlier in the same
+// flow is not an attempt at a password.
+func (s *ServiceTestSuite) TestAStepThatVerifiesNoSecretProducesNoEvidence() {
+	e := testEntity("count-9")
+	s.store.On("GetEntityWithCredentials", mock.Anything, e.ID).
+		Return(&entityWithCredentials{Entity: e, SchemaCredentials: testCredentialsJSON()}, nil)
+
+	_, failure, err := s.svc.AuthenticateEntityByID(s.ctx, e.ID,
+		map[string]interface{}{authnprovidercm.CredentialTypeProvisionedEntityID: "count-9"})
+	s.ErrorIs(err, ErrAuthenticationFailed)
+	s.Nil(failure)
 }
 
 // suspendedEntity returns a suspended entity.

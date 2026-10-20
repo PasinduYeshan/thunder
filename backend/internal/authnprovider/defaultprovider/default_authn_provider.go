@@ -20,6 +20,7 @@ import (
 	"github.com/thunder-id/thunderid/internal/authn/passkey"
 	authnprovidercm "github.com/thunder-id/thunderid/internal/authnprovider/common"
 	"github.com/thunder-id/thunderid/internal/entity"
+	"github.com/thunder-id/thunderid/internal/identitygovernance"
 	"github.com/thunder-id/thunderid/internal/system/log"
 )
 
@@ -30,7 +31,10 @@ type defaultAuthnProvider struct {
 	magicLinkService magiclink.MagicLinkAuthnServiceInterface
 	openid4vpService openid4vp.OpenID4VPServiceInterface
 	federatedAuths   map[providers.IDPType]authncommon.FederatedAuthenticator
-	logger           *log.Logger
+	// governance is the account-access authority for the entities this provider owns. Nil leaves
+	// identity governance disabled, exactly as it does at every other gate.
+	governance identitygovernance.IdentityGovernanceServiceInterface
+	logger     *log.Logger
 }
 
 // newDefaultAuthnProvider creates a new internal user authn provider.
@@ -38,7 +42,8 @@ func newDefaultAuthnProvider(entitySvc entity.EntityServiceInterface,
 	passkeyService passkey.PasskeyServiceInterface, otpService otp.OTPAuthnServiceInterface,
 	magicLinkService magiclink.MagicLinkAuthnServiceInterface,
 	openid4vpService openid4vp.OpenID4VPServiceInterface,
-	federatedAuths map[providers.IDPType]authncommon.FederatedAuthenticator) providers.AuthnProviderInterface {
+	federatedAuths map[providers.IDPType]authncommon.FederatedAuthenticator,
+	governance identitygovernance.IdentityGovernanceServiceInterface) providers.AuthnProviderInterface {
 	return &defaultAuthnProvider{
 		entitySvc:        entitySvc,
 		passkeyService:   passkeyService,
@@ -46,6 +51,7 @@ func newDefaultAuthnProvider(entitySvc entity.EntityServiceInterface,
 		magicLinkService: magicLinkService,
 		openid4vpService: openid4vpService,
 		federatedAuths:   federatedAuths,
+		governance:       governance,
 		logger:           log.GetLogger().With(log.String(log.LoggerKeyComponentName, "DefaultAuthnProvider")),
 	}
 }
@@ -77,11 +83,19 @@ func (p *defaultAuthnProvider) Authenticate(
 		return nil, newClientError(authnprovidercm.ErrorCodeAuthenticationFailed,
 			"Credentials are required", "Credentials are required for authentication")
 	}
-	res, svcErr := p.authenticateWithCredential(ctx, identifiers, credentials)
+	method := selectAuthenticationMethod(credentials)
+	res, failure, svcErr := p.authenticateWithCredential(ctx, identifiers, credentials, method)
+	if svcErr != nil {
+		return nil, p.handleAuthenticationFailure(ctx, method.method, failure, svcErr)
+	}
+	result, svcErr := p.buildAuthnResult(ctx, res)
 	if svcErr != nil {
 		return nil, svcErr
 	}
-	return p.buildAuthnResult(ctx, res)
+	if svcErr := p.checkAuthenticationAccess(ctx, method.method, result); svcErr != nil {
+		return nil, svcErr
+	}
+	return result, nil
 }
 
 // GetEntityReference retrieves the entity reference using the internal entity service.
@@ -284,6 +298,9 @@ func (p *defaultAuthnProvider) initiateEnrollmentWithPasskey(
 	}
 	result, svcErr := p.passkeyService.StartRegistration(ctx, req)
 	if svcErr != nil {
+		if stated := passkeyEnrollmentRefusal(svcErr); stated != nil {
+			return nil, stated
+		}
 		if svcErr.Type == tidcommon.ClientErrorType {
 			return nil, newClientError(authnprovidercm.ErrorCodeEnrollmentFailed,
 				svcErr.Error.DefaultValue, svcErr.ErrorDescription.DefaultValue)
@@ -318,6 +335,9 @@ func (p *defaultAuthnProvider) enrollWithPasskey(
 	}
 	result, svcErr := p.passkeyService.FinishRegistration(ctx, req)
 	if svcErr != nil {
+		if stated := passkeyEnrollmentRefusal(svcErr); stated != nil {
+			return nil, stated
+		}
 		if svcErr.Type == tidcommon.ClientErrorType {
 			return nil, newClientError(authnprovidercm.ErrorCodeEnrollmentFailed,
 				svcErr.Error.DefaultValue, svcErr.ErrorDescription.DefaultValue)
@@ -416,7 +436,7 @@ func (p *defaultAuthnProvider) buildAuthnResult(
 func (p *defaultAuthnProvider) buildEntityAuthnResult(
 	ctx context.Context, entityID string,
 ) (*providers.AuthnResult, *tidcommon.ServiceError) {
-	entityResult, getErr := p.entitySvc.GetEntity(ctx, entityID)
+	entityResult, getErr := p.entitySvc.GetEntityProfile(ctx, entityID)
 	if getErr != nil {
 		return nil, p.logAndReturnServerError(ctx, "Failed to get entity after authentication",
 			log.String("error", getErr.Error()))
@@ -439,6 +459,28 @@ func (p *defaultAuthnProvider) buildEntityAuthnResult(
 	return result, nil
 }
 
+// entityIDFromToken names the entity a token refers to, without loading it. A token carrying a user
+// id is the answer; anything else is identifying attributes to look up. Shared by the reference
+// resolver and the failure count.
+func (p *defaultAuthnProvider) entityIDFromToken(
+	ctx context.Context, token map[string]interface{}) (string, error) {
+	if idVal, ok := token[authnprovidercm.UserAttributeUserID]; ok {
+		if entityID, _ := idVal.(string); entityID != "" {
+			return entityID, nil
+		}
+	}
+	if authnprovidercm.IsFederatedToken(token) {
+		// A federated token names no entity here: the callers that can use its links resolve them
+		// first, and IdentifyEntity would scan for keys no index can answer.
+		return "", entity.ErrEntityNotFound
+	}
+	identifiedEntityID, err := p.entitySvc.IdentifyEntity(ctx, token)
+	if err != nil {
+		return "", err
+	}
+	return *identifiedEntityID, nil
+}
+
 // resolveEntityFromToken resolves the entity for a caller-supplied token (entity
 // reference token or attribute token). Failure to uniquely identify the entity is
 // reported as a client error since the caller controls the token contents.
@@ -447,11 +489,8 @@ func (p *defaultAuthnProvider) buildEntityAuthnResult(
 func (p *defaultAuthnProvider) resolveEntityFromToken(
 	ctx context.Context, token map[string]interface{}, tokenLabel string,
 ) (*providers.Entity, *tidcommon.ServiceError) {
-	entityID := ""
-	if idVal, ok := token[authnprovidercm.UserAttributeUserID]; ok {
-		entityID, _ = idVal.(string)
-	}
-	if entityID == "" && authnprovidercm.IsFederatedToken(token) {
+	if tokenID, _ := token[authnprovidercm.UserAttributeUserID].(string); tokenID == "" &&
+		authnprovidercm.IsFederatedToken(token) {
 		// A federated token resolves only through its recorded links. IdentifyEntity would scan for
 		// keys no index can answer.
 		linkedIDs, svcErr := p.resolveLinkedEntities(ctx, token)
@@ -463,30 +502,34 @@ func (p *defaultAuthnProvider) resolveEntityFromToken(
 			return nil, newClientError(authnprovidercm.ErrorCodeUserNotFound,
 				"User not found", "No user found matching the provided "+tokenLabel)
 		case 1:
-			entityID = linkedIDs[0]
+			return p.getEntityForToken(ctx, linkedIDs[0])
 		default:
 			return nil, newClientError(authnprovidercm.ErrorCodeAmbiguousUser,
 				"Ambiguous user", "Multiple users are linked to the provided "+tokenLabel)
 		}
 	}
-	if entityID == "" {
-		identifiedEntityID, identifyErr := p.entitySvc.IdentifyEntity(ctx, token)
-		if identifyErr != nil {
-			if errors.Is(identifyErr, entity.ErrEntityNotFound) {
-				return nil, newClientError(authnprovidercm.ErrorCodeUserNotFound,
-					"User not found", "No user found matching the provided "+tokenLabel)
-			}
-			if errors.Is(identifyErr, entity.ErrAmbiguousEntity) {
-				return nil, newClientError(authnprovidercm.ErrorCodeAmbiguousUser,
-					"Ambiguous user", "Multiple users found matching the provided "+tokenLabel)
-			}
-			return nil, p.logAndReturnServerError(ctx, "Failed to identify entity after authentication",
-				log.String("error", identifyErr.Error()))
+
+	entityID, identifyErr := p.entityIDFromToken(ctx, token)
+	if identifyErr != nil {
+		if errors.Is(identifyErr, entity.ErrEntityNotFound) {
+			return nil, newClientError(authnprovidercm.ErrorCodeUserNotFound,
+				"User not found", "No user found matching the provided "+tokenLabel)
 		}
-		entityID = *identifiedEntityID
+		if errors.Is(identifyErr, entity.ErrAmbiguousEntity) {
+			return nil, newClientError(authnprovidercm.ErrorCodeAmbiguousUser,
+				"Ambiguous user", "Multiple users found matching the provided "+tokenLabel)
+		}
+		return nil, p.logAndReturnServerError(ctx, "Failed to identify entity after authentication",
+			log.String("error", identifyErr.Error()))
 	}
 
-	entityResult, getErr := p.entitySvc.GetEntity(ctx, entityID)
+	return p.getEntityForToken(ctx, entityID)
+}
+
+// getEntityForToken reads the profile of the entity a token resolved to.
+func (p *defaultAuthnProvider) getEntityForToken(
+	ctx context.Context, entityID string) (*providers.Entity, *tidcommon.ServiceError) {
+	entityResult, getErr := p.entitySvc.GetEntityProfile(ctx, entityID)
 	if getErr != nil {
 		return nil, p.logAndReturnServerError(ctx, "Failed to get entity attributes",
 			log.String("error", getErr.Error()))
@@ -500,24 +543,22 @@ func (p *defaultAuthnProvider) resolveEntityFromToken(
 func (p *defaultAuthnProvider) authenticateWithCredential(
 	ctx context.Context,
 	identifiers, credentials map[string]interface{},
-) (*authncommon.AuthnResult, *tidcommon.ServiceError) {
-	if provisioned, ok := credentials[authnprovidercm.CredentialTypeProvisionedEntityID]; ok {
-		return p.authenticateForProvisioning(provisioned)
-	}
-	if passkeyCredential, ok := credentials[authnprovidercm.CredentialTypePasskey]; ok {
-		return p.authenticateWithPasskey(ctx, passkeyCredential)
-	}
-	if otpCredential, ok := credentials[authnprovidercm.CredentialTypeOTP]; ok {
-		return p.authenticateWithOTP(ctx, otpCredential)
-	}
-	if fedCred, ok := credentials[authnprovidercm.CredentialTypeFederated]; ok {
-		return p.authenticateWithFederated(ctx, fedCred)
-	}
-	if mlCred, ok := credentials[authnprovidercm.CredentialTypeMagicLink]; ok {
-		return p.authenticateWithMagicLink(ctx, mlCred)
-	}
-	if vpCred, ok := credentials[authnprovidercm.CredentialTypeOpenID4VP]; ok {
-		return p.authenticateWithOpenID4VP(ctx, vpCred)
+	method credentialMethod,
+) (*authncommon.AuthnResult, *attributedFailure, *tidcommon.ServiceError) {
+	credential := credentials[method.credentialType]
+	switch method.credentialType {
+	case authnprovidercm.CredentialTypeProvisionedEntityID:
+		return withoutFailure(p.authenticateForProvisioning(credential))
+	case authnprovidercm.CredentialTypePasskey:
+		return withoutFailure(p.authenticateWithPasskey(ctx, credential))
+	case authnprovidercm.CredentialTypeOTP:
+		return p.authenticateWithOTP(ctx, credential)
+	case authnprovidercm.CredentialTypeFederated:
+		return withoutFailure(p.authenticateWithFederated(ctx, credential))
+	case authnprovidercm.CredentialTypeMagicLink:
+		return withoutFailure(p.authenticateWithMagicLink(ctx, credential))
+	case authnprovidercm.CredentialTypeOpenID4VP:
+		return withoutFailure(p.authenticateWithOpenID4VP(ctx, credential))
 	}
 	if userID, ok := identifiers[authnprovidercm.UserAttributeUserID]; ok && userID != "" {
 		return p.authenticateByUserID(ctx, userID, credentials)
@@ -525,8 +566,9 @@ func (p *defaultAuthnProvider) authenticateWithCredential(
 	return p.authenticateByIdentifiers(ctx, identifiers, credentials)
 }
 
-// authenticateForProvisioning simulates a successful authentication for a provisioned entity.
-// The raw credential is expected to be a non-empty userID string.
+// authenticateForProvisioning simulates a successful authentication for an entity the flow already
+// resolved: one it provisioned, or a link holder the user picked. The raw credential is expected to be
+// a non-empty userID string.
 func (p *defaultAuthnProvider) authenticateForProvisioning(
 	raw interface{},
 ) (*authncommon.AuthnResult, *tidcommon.ServiceError) {
@@ -564,37 +606,38 @@ func (p *defaultAuthnProvider) authenticateWithPasskey(
 // The raw credential is expected to be a map with "sessionToken" and "otp" string fields.
 func (p *defaultAuthnProvider) authenticateWithOTP(
 	ctx context.Context, raw interface{},
-) (*authncommon.AuthnResult, *tidcommon.ServiceError) {
+) (*authncommon.AuthnResult, *attributedFailure, *tidcommon.ServiceError) {
 	otpCredential, ok := raw.(map[string]interface{})
 	if !ok {
-		return nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
+		return nil, nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
 			"Invalid OTP payload", "The provided OTP credential is invalid")
 	}
 	sessionToken, ok := otpCredential["sessionToken"].(string)
 	if !ok || sessionToken == "" {
-		return nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
+		return nil, nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
 			"Invalid OTP payload", "sessionToken is required")
 	}
 	otpValue, ok := otpCredential["otp"].(string)
 	if !ok || otpValue == "" {
-		return nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
+		return nil, nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
 			"Invalid OTP payload", "otp is required")
 	}
-	result, authErr := p.otpService.Authenticate(ctx, sessionToken, otpValue)
+	result, failure, authErr := p.otpService.Authenticate(ctx, sessionToken, otpValue)
 	if authErr != nil {
 		if authErr.Type == tidcommon.ClientErrorType {
 			if authErr.Code == otp.ErrorIncorrectOTP.Code {
-				return nil, newClientError(authnprovidercm.ErrorCodeAuthenticationFailed,
-					authErr.Error.DefaultValue, authErr.ErrorDescription.DefaultValue)
+				return nil, otpFailureOf(failure),
+					newClientError(authnprovidercm.ErrorCodeAuthenticationFailed,
+						authErr.Error.DefaultValue, authErr.ErrorDescription.DefaultValue)
 			}
-			return nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
+			return nil, nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
 				authErr.Error.DefaultValue, authErr.ErrorDescription.DefaultValue)
 		}
-		return nil, p.logAndReturnServerError(ctx, "OTP authentication failed with server error",
+		return nil, nil, p.logAndReturnServerError(ctx, "OTP authentication failed with server error",
 			log.String("error", authErr.Error.DefaultValue),
 			log.String("errorDescription", authErr.ErrorDescription.DefaultValue))
 	}
-	return result, nil
+	return result, nil, nil
 }
 
 // authenticateWithFederated authenticates the user using a federated identity provider.
@@ -689,34 +732,36 @@ func (p *defaultAuthnProvider) authenticateWithOpenID4VP(
 // authenticateByUserID authenticates the user using a user ID and credentials.
 func (p *defaultAuthnProvider) authenticateByUserID(
 	ctx context.Context, userID interface{}, credentials map[string]interface{},
-) (*authncommon.AuthnResult, *tidcommon.ServiceError) {
+) (*authncommon.AuthnResult, *attributedFailure, *tidcommon.ServiceError) {
 	userIDStr, ok := userID.(string)
 	if !ok || userIDStr == "" {
-		return nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
+		return nil, nil, newClientError(authnprovidercm.ErrorCodeInvalidRequest,
 			"Invalid user ID", "The provided userID is invalid")
 	}
-	result, authErr := p.entitySvc.AuthenticateEntityByID(ctx, userIDStr, credentials)
+	result, failure, authErr := p.entitySvc.AuthenticateEntityByID(ctx, userIDStr, credentials)
 	if authErr != nil {
-		return nil, p.handleEntityAuthError(ctx, authErr, "Basic authentication by ID failed with server error")
+		return nil, credentialFailureOf(failure),
+			p.handleEntityAuthError(ctx, authErr, "Basic authentication by ID failed with server error")
 	}
 	return &authncommon.AuthnResult{
 		Token:               map[string]interface{}{authnprovidercm.UserAttributeUserID: result.EntityID},
 		AuthenticatedClaims: map[string]interface{}{authnprovidercm.UserAttributeUserID: result.EntityID},
-	}, nil
+	}, nil, nil
 }
 
 // authenticateByIdentifiers authenticates the user using a set of identifiers and credentials.
 func (p *defaultAuthnProvider) authenticateByIdentifiers(
 	ctx context.Context, identifiers, credentials map[string]interface{},
-) (*authncommon.AuthnResult, *tidcommon.ServiceError) {
-	result, authErr := p.entitySvc.AuthenticateEntity(ctx, identifiers, credentials)
+) (*authncommon.AuthnResult, *attributedFailure, *tidcommon.ServiceError) {
+	result, failure, authErr := p.entitySvc.AuthenticateEntity(ctx, identifiers, credentials)
 	if authErr != nil {
-		return nil, p.handleEntityAuthError(ctx, authErr, "Basic authentication failed with server error")
+		return nil, credentialFailureOf(failure),
+			p.handleEntityAuthError(ctx, authErr, "Basic authentication failed with server error")
 	}
 	return &authncommon.AuthnResult{
 		Token:               map[string]interface{}{authnprovidercm.UserAttributeUserID: result.EntityID},
 		AuthenticatedClaims: map[string]interface{}{authnprovidercm.UserAttributeUserID: result.EntityID},
-	}, nil
+	}, nil, nil
 }
 
 func (p *defaultAuthnProvider) handleEntityAuthError(

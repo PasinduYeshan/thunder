@@ -4,6 +4,8 @@
 package executor
 
 import (
+	"time"
+
 	"github.com/thunder-id/thunderid/internal/entitytype"
 	"github.com/thunder-id/thunderid/internal/flow/executormeta"
 	oauth2const "github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
@@ -64,6 +66,8 @@ const (
 	ExecutorNameActionDeletion               = executormeta.ExecutorNameActionDeletion
 	ExecutorNameOwnerResolver                = executormeta.ExecutorNameOwnerResolver
 	ExecutorNameAgentTypeResolver            = executormeta.ExecutorNameAgentTypeResolver
+	ExecutorNameIdentityGovernance           = executormeta.ExecutorNameIdentityGovernance
+	ExecutorNamePreSuspend                   = executormeta.ExecutorNamePreSuspend
 )
 
 // Executor mode constants
@@ -178,6 +182,9 @@ const (
 	propertyKeyProvisioningMode = "mode"
 	propertyKeyRequiredScopes   = "requiredScopes"
 	propertyKeyEmailTemplate    = "emailTemplate"
+	// propertyKeyBestEffort marks a delivery node whose failure must not fail the flow, which the
+	// flow graph's edges cannot express.
+	propertyKeyBestEffort = "bestEffort"
 	// TODO: Revisit propertyKeyTokenExpiry and propertyKeyMagicLinkURL — these should not be node properties.
 	propertyKeyTokenExpiry                             = "tokenExpiry"
 	propertyKeyMagicLinkURL                            = "magicLinkURL"
@@ -206,6 +213,29 @@ const (
 	// element is optional.
 	propertyKeyConsentFailOnDeny = "failOnDeny"
 )
+
+// The lifecycle operations, as one executor selected by node mode. They share target resolution,
+// trust boundary and response shape, and differ only in the method they call.
+const (
+	// governanceModeUnlock releases every lock, the post-suspension hold included. It restores
+	// nothing, since a lock only withholds fresh authentication.
+	governanceModeUnlock = "unlock"
+	// governanceModeSuspend places an administrative security hold on the subject named by the
+	// trusted plan a PreSuspendExecutor published, after the containment nodes have run on it.
+	governanceModeSuspend = "suspend"
+	// governanceModeUnsuspend releases the hold without running the revocation nodes. For a user it
+	// leaves an entity-wide lock that a recovery or an unlock clears.
+	governanceModeUnsuspend = "unsuspend"
+)
+
+// governanceInputOperatorNote is the optional free-text note a suspend node may collect. It is
+// stored for management reads, never reaches a refusal, and is ignored by every other mode.
+const governanceInputOperatorNote = "operatorNote"
+
+// suspensionRevocationTTL keeps a suspension's deny-list rows long enough to outlast any token the
+// subject held, whichever client issued it.
+// TODO(#5805): use the server-wide maximum token lifetime once it is introduced.
+const suspensionRevocationTTL = 7 * 24 * time.Hour
 
 // nonSearchableInputs contains the list of user inputs/ attributes that are non-searchable.
 var nonSearchableInputs = []string{
