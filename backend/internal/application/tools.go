@@ -184,7 +184,7 @@ func (t *applicationTools) getApplicationByID(
 		return nil, nil, fmt.Errorf("failed to get application: %s", svcErr.ErrorDescription)
 	}
 
-	return nil, app, nil
+	return nil, toolView(app), nil
 }
 
 // getApplicationByClientID handles the get_application_by_client_id tool call.
@@ -205,7 +205,15 @@ func (t *applicationTools) getApplicationByClientID(
 		return nil, nil, fmt.Errorf("failed to get application: %s", svcErr.ErrorDescription)
 	}
 
-	return nil, app, nil
+	return nil, toolView(app), nil
+}
+
+// toolView returns a copy of the application without the subject attribute mapping, which the tools
+// neither accept nor return, so an application read here can be sent back to update_application.
+func toolView(app *providers.Application) *providers.Application {
+	view := *app
+	view.SubjectAttribute = nil
+	return &view
 }
 
 // createApplication handles the create_application tool call.
@@ -214,6 +222,8 @@ func (t *applicationTools) createApplication(
 	req *mcp.CallToolRequest,
 	input model.ApplicationDTO,
 ) (*mcp.CallToolResult, *model.ApplicationDTO, error) {
+	// Not part of the tool input; see getCommonSchemaModifiers.
+	input.SubjectAttribute = nil
 	createdApp, svcErr := t.appService.CreateApplication(ctx, &input)
 	if svcErr != nil {
 		return nil, nil, fmt.Errorf("failed to create application: %s", svcErr.ErrorDescription)
@@ -228,6 +238,8 @@ func (t *applicationTools) updateApplication(
 	req *mcp.CallToolRequest,
 	input model.ApplicationDTO,
 ) (*mcp.CallToolResult, *model.ApplicationDTO, error) {
+	// Not part of the tool input; see getCommonSchemaModifiers.
+	input.SubjectAttribute = nil
 	updatedApp, svcErr := t.appService.UpdateApplication(ctx, input.ID, &input)
 	if svcErr != nil {
 		return nil, nil, fmt.Errorf("failed to update application: %s", svcErr.ErrorDescription)
@@ -388,9 +400,13 @@ func (t *applicationTools) getApplicationTemplates(
 }
 
 // getCommonSchemaModifiers returns the common schema modifiers for ApplicationDTO.
+//
+// The tools configure the same inbound authentication profile as the application API, which does not
+// apply the subject attribute mapping, so the mapping is left out of their input.
 func getCommonSchemaModifiers() []func(*jsonschema.Schema) {
 	oauthCfg := oauthconfig.FromServerRuntime()
 	return []func(*jsonschema.Schema){
+		tool.WithRemove("", "subjectAttribute"),
 		tool.WithEnum("inbound_auth_config.config", "grant_types", oauthCfg.OAuth.AllowedGrantTypes),
 		tool.WithEnum("inbound_auth_config.config", "response_types", oauthCfg.OAuth.AllowedResponseTypes),
 		tool.WithEnum("inbound_auth_config.config", "token_endpoint_auth_method", oauthCfg.OAuth.AllowedAuthMethods),

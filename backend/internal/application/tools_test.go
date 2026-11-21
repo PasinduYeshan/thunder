@@ -5,6 +5,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -546,17 +547,202 @@ func (suite *ApplicationToolsTestSuite) TestGetCommonSchemaModifiers() {
 	modifiers := getCommonSchemaModifiers()
 
 	assert.NotNil(suite.T(), modifiers)
-	assert.Len(suite.T(), modifiers, 4)
+	assert.Len(suite.T(), modifiers, 5)
 }
 
 func (suite *ApplicationToolsTestSuite) TestGetCreateAppSchema() {
 	schema := getCreateAppSchema()
 
-	assert.NotNil(suite.T(), schema)
+	suite.Require().NotNil(schema)
+	assert.Contains(suite.T(), schema.Properties, "allowedUserTypes")
+	assert.NotContains(suite.T(), schema.Properties, "subjectAttribute")
+	assert.NotContains(suite.T(), schema.Properties, "id")
 }
 
 func (suite *ApplicationToolsTestSuite) TestGetUpdateAppSchema() {
 	schema := getUpdateAppSchema()
 
-	assert.NotNil(suite.T(), schema)
+	suite.Require().NotNil(schema)
+	assert.Contains(suite.T(), schema.Properties, "allowedUserTypes")
+	assert.NotContains(suite.T(), schema.Properties, "subjectAttribute")
+	assert.Contains(suite.T(), schema.Required, "id")
+}
+
+func (suite *ApplicationToolsTestSuite) TestCreateApplication_IgnoresSubjectAttribute() {
+	mockService := NewApplicationServiceInterfaceMock(suite.T())
+	tools := &applicationTools{appService: mockService}
+
+	inputApp := model.ApplicationDTO{
+		Name: "New App",
+		InboundAuthProfile: providers.InboundAuthProfile{
+			AllowedUserTypes: []string{"customer"},
+			SubjectAttribute: map[string]string{"customer": "email"},
+		},
+	}
+	createdApp := &model.ApplicationDTO{ID: "new-app-id", Name: "New App"}
+
+	mockService.On("CreateApplication", mock.Anything, mock.MatchedBy(func(dto *model.ApplicationDTO) bool {
+		return dto.SubjectAttribute == nil && len(dto.AllowedUserTypes) == 1
+	})).Return(createdApp, nil)
+
+	_, output, err := tools.createApplication(context.Background(), &mcp.CallToolRequest{}, inputApp)
+
+	assert.NoError(suite.T(), err)
+	assert.Equal(suite.T(), createdApp, output)
+	mockService.AssertExpectations(suite.T())
+}
+
+func (suite *ApplicationToolsTestSuite) TestUpdateApplication_IgnoresSubjectAttribute() {
+	mockService := NewApplicationServiceInterfaceMock(suite.T())
+	tools := &applicationTools{appService: mockService}
+
+	inputApp := model.ApplicationDTO{
+		ID:   "app123",
+		Name: "Updated App",
+		InboundAuthProfile: providers.InboundAuthProfile{
+			AllowedUserTypes: []string{"customer"},
+			SubjectAttribute: map[string]string{"customer": "email"},
+		},
+	}
+	updatedApp := &model.ApplicationDTO{ID: "app123", Name: "Updated App"}
+
+	mockService.On("UpdateApplication", mock.Anything, "app123",
+		mock.MatchedBy(func(dto *model.ApplicationDTO) bool {
+			return dto.SubjectAttribute == nil && len(dto.AllowedUserTypes) == 1
+		})).Return(updatedApp, nil)
+
+	_, output, err := tools.updateApplication(context.Background(), &mcp.CallToolRequest{}, inputApp)
+
+	assert.NoError(suite.T(), err)
+	assert.Equal(suite.T(), updatedApp, output)
+	mockService.AssertExpectations(suite.T())
+}
+
+func (suite *ApplicationToolsTestSuite) TestGetApplicationTools_OmitSubjectAttribute() {
+	stored := &providers.Application{
+		ID:   "app123",
+		Name: "Test App",
+		InboundAuthProfile: providers.InboundAuthProfile{
+			AllowedUserTypes: []string{"customer"},
+			SubjectAttribute: map[string]string{"customer": "email"},
+		},
+	}
+	mockService := NewApplicationServiceInterfaceMock(suite.T())
+	mockService.On("GetApplication", mock.Anything, "app123").Return(stored, nil)
+	mockService.On("GetOAuthApplication", mock.Anything, "client123").
+		Return(&providers.OAuthClient{ID: "app123", ClientID: "client123"}, nil)
+	tools := &applicationTools{appService: mockService}
+
+	byID, byIDOutput, err := tools.getApplicationByID(context.Background(), &mcp.CallToolRequest{},
+		tool.IDInput{ID: "app123"})
+	suite.Require().NoError(err)
+	assert.Nil(suite.T(), byID)
+	_, byClientIDOutput, err := tools.getApplicationByClientID(context.Background(), &mcp.CallToolRequest{},
+		model.ClientIDInput{ClientID: "client123"})
+	suite.Require().NoError(err)
+
+	for _, output := range []*providers.Application{byIDOutput, byClientIDOutput} {
+		assert.Nil(suite.T(), output.SubjectAttribute)
+		assert.Equal(suite.T(), "Test App", output.Name)
+		assert.Equal(suite.T(), []string{"customer"}, output.AllowedUserTypes)
+	}
+	assert.Equal(suite.T(), map[string]string{"customer": "email"}, stored.SubjectAttribute,
+		"the service's application must not be modified")
+}
+
+// TestCallTool_SubjectAttributeNotAccepted calls the registered tools over an MCP session: a
+// subjectAttribute argument is refused before the service is reached, and the same call without it
+// goes through.
+func (suite *ApplicationToolsTestSuite) TestCallTool_SubjectAttributeNotAccepted() {
+	for _, tc := range []struct {
+		name        string
+		tool        string
+		method      string
+		withMapping bool
+	}{
+		{name: "create refuses subjectAttribute", tool: "create_application", method: "CreateApplication",
+			withMapping: true},
+		{name: "update refuses subjectAttribute", tool: "update_application", method: "UpdateApplication",
+			withMapping: true},
+		{name: "create without it", tool: "create_application", method: "CreateApplication"},
+		{name: "update without it", tool: "update_application", method: "UpdateApplication"},
+	} {
+		suite.Run(tc.name, func() {
+			mockService := NewApplicationServiceInterfaceMock(suite.T())
+			args := map[string]any{
+				"name":                      "App",
+				"type":                      "fullstack",
+				"allowedUserTypes":          []string{"customer"},
+				"isRegistrationFlowEnabled": false,
+				"isRecoveryFlowEnabled":     false,
+			}
+			if tc.tool == "update_application" {
+				args["id"] = "app123"
+			}
+			if tc.withMapping {
+				args["subjectAttribute"] = map[string]string{"customer": "email"}
+			}
+			returned := &model.ApplicationDTO{ID: "app123", Name: "App"}
+			mockService.On("CreateApplication", mock.Anything, mock.Anything).Return(returned, nil).Maybe()
+			mockService.On("UpdateApplication", mock.Anything, "app123", mock.Anything).Return(returned, nil).Maybe()
+
+			result, err := suite.toolSession(mockService).CallTool(context.Background(),
+				&mcp.CallToolParams{Name: tc.tool, Arguments: args})
+
+			suite.Require().NoError(err)
+			if tc.withMapping {
+				assert.True(suite.T(), result.IsError, "the call must be refused")
+				assert.Contains(suite.T(), toolResultText(result), "subjectAttribute")
+				mockService.AssertNumberOfCalls(suite.T(), tc.method, 0)
+			} else {
+				assert.False(suite.T(), result.IsError, "content: %s", toolResultText(result))
+				mockService.AssertNumberOfCalls(suite.T(), tc.method, 1)
+			}
+		})
+	}
+}
+
+func (suite *ApplicationToolsTestSuite) TestListTools_ApplicationInputOmitsSubjectAttribute() {
+	listed, err := suite.toolSession(NewApplicationServiceInterfaceMock(suite.T())).
+		ListTools(context.Background(), nil)
+	suite.Require().NoError(err)
+
+	checked := 0
+	for _, registered := range listed.Tools {
+		if registered.Name != "create_application" && registered.Name != "update_application" {
+			continue
+		}
+		checked++
+		schema, err := json.Marshal(registered.InputSchema)
+		suite.Require().NoError(err)
+		assert.Contains(suite.T(), string(schema), "allowedUserTypes", "tool %q", registered.Name)
+		assert.NotContains(suite.T(), string(schema), "subjectAttribute", "tool %q", registered.Name)
+	}
+	assert.Equal(suite.T(), 2, checked)
+}
+
+// toolSession registers the application tools on a new server and returns a client session to it.
+func (suite *ApplicationToolsTestSuite) toolSession(appService ApplicationServiceInterface) *mcp.ClientSession {
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "1.0.0"}, nil)
+	registerMCPTools(server, appService)
+	ctx := context.Background()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	_, err := server.Connect(ctx, serverTransport, nil)
+	suite.Require().NoError(err)
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1.0.0"}, nil).
+		Connect(ctx, clientTransport, nil)
+	suite.Require().NoError(err)
+	suite.T().Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+// toolResultText joins the text content of a tool result.
+func toolResultText(result *mcp.CallToolResult) string {
+	var text string
+	for _, c := range result.Content {
+		if t, ok := c.(*mcp.TextContent); ok {
+			text += t.Text
+		}
+	}
+	return text
 }

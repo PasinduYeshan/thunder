@@ -4,7 +4,9 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"time"
 
@@ -59,4 +61,67 @@ func (ts *MCPTestSuite) TestApplicationTools_RegenerateSecretRevokesItsTokens() 
 	active, err = testutils.IntrospectToken(issued.Token.AccessToken, clientID, newSecret)
 	ts.Require().NoError(err)
 	ts.True(active, "a token the new secret issued was not active")
+}
+
+// create_application and update_application take the same inbound authentication profile as the
+// application API: subjectAttribute is not in their input schema, a call that carries it is refused,
+// and the same call without it succeeds.
+func (ts *MCPTestSuite) TestApplicationTools_CreateAndUpdateTakeTheAPIProfile() {
+	token := ts.mcpScopedAdminToken()
+
+	message, body := ts.postStatelessMCP(token, "tools/list", "", map[string]any{})
+	var listed struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Properties map[string]any `json:"properties"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	ts.Require().NoErrorf(json.Unmarshal([]byte(message), &listed), "tools/list returned: %s", body)
+	checked := 0
+	for _, tool := range listed.Result.Tools {
+		if tool.Name != "create_application" && tool.Name != "update_application" {
+			continue
+		}
+		checked++
+		ts.Contains(tool.InputSchema.Properties, "allowedUserTypes", "tool %q", tool.Name)
+		ts.NotContains(tool.InputSchema.Properties, "subjectAttribute", "tool %q", tool.Name)
+	}
+	ts.Equal(2, checked, "tools/list must list create_application and update_application")
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	args := map[string]any{
+		"name":                      "mcp_profile_app_" + suffix,
+		"ouId":                      ts.ouID,
+		"type":                      "fullstack",
+		"isRegistrationFlowEnabled": false,
+		"isRecoveryFlowEnabled":     false,
+	}
+	withMapping := func(in map[string]any) map[string]any {
+		out := maps.Clone(in)
+		out["subjectAttribute"] = map[string]string{"customer": "email"}
+		return out
+	}
+
+	refused, raw := ts.callMCPTool(token, "create_application", withMapping(args))
+	ts.Truef(refused.Result.IsError, "create_application with subjectAttribute must be refused: %s", raw)
+
+	created, raw := ts.callMCPTool(token, "create_application", args)
+	ts.Require().Falsef(created.Result.IsError, "create_application failed: %s", raw)
+	appID, _ := created.Result.StructuredContent["id"].(string)
+	ts.Require().NotEmpty(appID)
+	ts.T().Cleanup(func() { _ = testutils.DeleteApplication(appID) })
+
+	update := maps.Clone(args)
+	update["id"] = appID
+	update["description"] = "updated"
+	refused, raw = ts.callMCPTool(token, "update_application", withMapping(update))
+	ts.Truef(refused.Result.IsError, "update_application with subjectAttribute must be refused: %s", raw)
+
+	updated, raw := ts.callMCPTool(token, "update_application", update)
+	ts.Require().Falsef(updated.Result.IsError, "update_application failed: %s", raw)
+	ts.Equal("updated", updated.Result.StructuredContent["description"])
 }
